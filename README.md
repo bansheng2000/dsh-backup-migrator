@@ -65,7 +65,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 设置页 →「备份与换机」：
 
 1. 勾要备份的内容；
-2. 填备份目录（留空 = `%USERPROFILE%\.dsh\backups`）、格式、保留份数、自动间隔；
+2. 点「选择文件夹…」定备份目录（留空 = `%USERPROFILE%\.dsh\backups`），再定格式、保留份数、自动间隔；
 3. 点「备份到 …」，进度条跑完即完成；
 4. 换机时把备份文件拷到新电脑，在同一面板里「选择备份文件…」上传 → 看校验结果 → 选还原方式。
 
@@ -88,4 +88,4 @@ node test/selftest.mjs
 
 - `node_modules` 不进包（1.2GB 的可再生文件）。换机还原时 `restore.ps1` 会自己遍历 profile 目录跑 `dsh plugin --profile <name> install` 把插件装回来；找不到 `dsh` 命令才需要你手动来一遍。
 - profile 里插件的 `package.json` 用的是**绝对路径** `file:` 依赖（本机实测写成了乱码路径），换盘符后这些 `file:` 会失效 —— 需要在 profile 里改成相对路径或改成已发布版本，再 `pnpm install`。聊天记录、记忆等数据不受影响。
-- 浏览器弹不出系统文件选择框，导出用的是「文本框填路径 + 复制」。
+- 文件夹用宿主自带的原生对话框点选（桌面端 preload `__DSH_DIRECTORY_PICKER__.pick()`，Web GUI 走 `uiWorkspace.pickDirectory()`）；远程连过来、宿主也拿不到对话框时，按钮会提示改用文本框手填。

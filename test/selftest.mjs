@@ -208,6 +208,20 @@ step("CSS 每条规则都以自建 DOM 祖先类 .bm-wrap 为前缀", () => {
   assert.ok(source.includes('className: "bm-wrap"'), "渲染树根节点必须带 .bm-wrap，否则前缀选择器匹配不到");
 });
 
+// ---- 8. 选文件夹接的是宿主现成能力，不是自己画的输入框 -----------------------
+// 用户明确要求「像选备份文件那样点选文件夹，不要填地址」。桌面端 preload 暴露
+// __DSH_DIRECTORY_PICKER__.pick()；Web GUI 没有 preload，退回 ctx.uiWorkspace.pickDirectory()
+// （它转 remote 由主进程弹框）。两条都拿不到才回 null，面板提示手动填。
+step("选文件夹走宿主原生对话框，并留了手动填的退路", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(source.includes("__DSH_DIRECTORY_PICKER__"), "没接桌面端原生文件夹对话框");
+  assert.ok(source.includes("pickDirectory()"), "没接宿主 uiWorkspace.pickDirectory");
+  assert.ok(source.includes("chooseDir"), "面板没挂 chooseDir");
+  // 备份目录与导出目的地都要能点选，两个入口都在。
+  assert.equal((source.match(/chooseDir\("选目录中"/g) ?? []).length, 2, "备份目录与导出目的地两个入口都要能点选");
+  assert.ok(!source.includes("插件弹不了系统文件选择框"), "过时的说明文案没删");
+});
+
 console.log("dsh-backup-migrator selftest");
 console.log(steps.join("\n"));
 rmSync(tmp, { recursive: true, force: true });
