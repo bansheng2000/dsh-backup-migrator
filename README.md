@@ -57,7 +57,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.1.0"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.2.0"
 ```
 
 ## 用法
