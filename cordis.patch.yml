@@ -1,0 +1,23 @@
+# dsh-backup-migrator — DSH 配置/数据备份与一键换机
+#
+# 必须用 `- insert:` 包裹顶层 `- id:`：bundle patch 里扁平 `- id:` 只会被 loader
+# 当成「改已有条目配置」，条目不存在时是空操作，插件永远挂不上。
+#
+# 全部字段都可缺省；下面的默认值即「装上即可用」的状态（不自动备份、存到
+# ~/.dsh/backups、只备份聊天记录与配置）。设置页可改。
+- insert:
+    - id: backup-migrator
+      name: dsh-backup-migrator
+      config:
+        options:
+          storeDir: ""
+          format: zip
+          items:
+            - sessions
+            - memories
+            - storages
+            - integrations
+            - attachments
+            - profiles
+          autoIntervalMin: 0
+          keepCount: 10
