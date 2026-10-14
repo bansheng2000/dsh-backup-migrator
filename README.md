@@ -23,20 +23,24 @@
 
 ## 安装
 
-在 DSH 的 profile 目录（`%USERPROFILE%\.dsh\profiles\desktop`）的 `package.json` 里加两处：
+在 DSH 的 profile 目录（`%USERPROFILE%\.dsh\profiles\desktop`）的 `package.json` 里加两处。
+
+**注意 bundle 名必须是包名 `dsh-backup-migrator`** —— 写短了（如 `backup-migrator`）宿主会一直报 `cannot resolve profile bundle`，插件永远挂不上：
 
 ```jsonc
 {
   "dependencies": {
-    "dsh-backup-migrator": "file:E:/文档/deepseek-harness/dsh-backup-migrator"
+    "dsh-backup-migrator": "github:bansheng2000/dsh-backup-migrator"
   },
   "dsh": {
     "profile": {
-      "bundles": ["backup-migrator"]
+      "bundles": ["dsh-backup-migrator"]
     }
   }
 }
 ```
+
+本地开发时把依赖换成绝对正斜杠的 `file:` 路径：`"dsh-backup-migrator": "file:E:/path/to/dsh-backup-migrator"`。
 
 然后在该目录里装依赖（用 DSH 自带的 pnpm）：
 
@@ -47,6 +51,14 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 重启 DSH，设置页出现「备份与换机」。
 
 > `file:` 依赖装进 profile 的是**真实拷贝**不是链接 —— 改了仓库代码必须重跑一次 `install`，否则改动不生效。
+
+> `github:` 简写会走 `git ls-remote git+ssh://git@github.com/...`，没配 ssh key 的机器会 exit 128。配一条 `git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/"` 即可。
+
+想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
+
+```jsonc
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.1.0"
+```
 
 ## 用法
 
@@ -74,6 +86,6 @@ node test/selftest.mjs
 
 ## 已知限制
 
-- `node_modules` 不进包：换机还原后需要在各 profile 目录跑一次 `pnpm install`（`restore.ps1` 结尾会提醒）。
+- `node_modules` 不进包（1.2GB 的可再生文件）。换机还原时 `restore.ps1` 会自己遍历 profile 目录跑 `dsh plugin --profile <name> install` 把插件装回来；找不到 `dsh` 命令才需要你手动来一遍。
 - profile 里插件的 `package.json` 用的是**绝对路径** `file:` 依赖（本机实测写成了乱码路径），换盘符后这些 `file:` 会失效 —— 需要在 profile 里改成相对路径或改成已发布版本，再 `pnpm install`。聊天记录、记忆等数据不受影响。
 - 浏览器弹不出系统文件选择框，导出用的是「文本框填路径 + 复制」。
