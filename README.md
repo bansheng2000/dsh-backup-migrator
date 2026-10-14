@@ -84,6 +84,14 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 
 窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
 
+下载（v0.3.0，win-x64，49MB）：
+
+```
+https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.0/DSH-Backup-Assistant-0.3.0-win-x64.exe
+```
+
+（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.0-win-x64.exe`，双击一样能跑。）
+
 ### 目录结构
 
 ```
