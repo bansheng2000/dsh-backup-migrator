@@ -57,7 +57,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.2.0"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.0"
 ```
 
 ## 用法
@@ -69,6 +69,55 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 3. 点「备份到 …」，进度条跑完即完成；
 4. 换机时把备份文件拷到新电脑，在同一面板里「选择备份文件…」上传 → 看校验结果 → 选还原方式。
 
+## 备份助手 EXE（换机不用先装插件）
+
+插件要装进 profile 才能用，但换机那台电脑上还没有 profile —— 这是个死锁。`tool/` 里是一个自包含的单文件 EXE，把插件源码**嵌在自己身上**：新电脑上先跑它，插件就装好了。
+
+### 四个入口
+
+```powershell
+& "DSH备份助手.exe"                # 打开窗口（默认，就用这个）
+& "DSH备份助手.exe" --selftest     # 自检，40+ 项，用来确认这份 EXE 本身没坏
+& "DSH备份助手.exe" --restore 备份.zip   # 无界面直写数据目录（给脚本用）
+& "DSH备份助手.exe" --stage   备份.zip   # 无界面解到暂存区 + restore.ps1
+```
+
+窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
+
+### 目录结构
+
+```
+DSH备份助手.exe        49MB，自包含，带 .NET 运行时，目标机不用装任何东西
+备份目录.txt           可选，一行绝对路径；没有就用 <数据根>\backups
+dsh-backup-assistant.log
+plugin\               EXE 首次运行时从内嵌 zip 解出来的插件源码
+```
+
+换机：把 `DSH备份助手.exe` 拷到 U 盘 → 新电脑上双击 → 「装插件」→ 「导入备份」选 U 盘里的备份文件。
+
+### 构建
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File tool/build.ps1 -Output C:\out
+```
+
+四步：把插件的六个文件组到 `payload\stage` → 打成 `payload\plugin.zip` → `dotnet publish` 单文件自包含（win-x64，约 35 秒）→ 删掉输出目录里除 EXE 外的文件。要 .NET SDK 10；只用得到系统自带的 `tar.exe`，没有第三方运行时依赖。
+
+### 默认值与理由
+
+| 项 | 默认 | 为什么 |
+| --- | --- | --- |
+| 备份目录 | `<数据根>\backups` | 与插件侧空值时的默认值同源，两边不会各存一份 |
+| 改目录时怎么搬 EXE | **复制**，同名加 `-2` 序号 | 原件留作退路；绝不覆盖目标目录里的未知文件 |
+| 导入方式 | 默认**直写**，旁边另有「解到暂存区…」 | 直写是大多数情况；不确定就先解暂存区看一遍 |
+| 数字签名 | 无 | 没有证书；README 说明了 SmartScreen 怎么办 |
+
+签名之外只有一个已知摩擦：SmartScreen 可能弹「Windows 已保护你的电脑」→ 点「更多信息」→「仍要运行」。
+
+### 已知限制
+
+- **它不装 `node_modules`** —— 只把插件源码放进 profile 的 `node_modules\dsh-backup-migrator` 并改 `package.json` 两处（`bundles` 加**包名**、`dependencies` 加 `file:`），真正的依赖安装交给 DSH 自带的 node + pnpm 跑一次（找不到时会打印手动命令）。
+- 导入前请**完全退出 DSH**，否则正在运行的宿主会和还原过程抢同一批文件。窗口会检测并在状态行提示。
 ## 测试
 
 ```powershell

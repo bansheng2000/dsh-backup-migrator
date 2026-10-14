@@ -1,1 +1,8 @@
 node_modules/
+
+# 备份助手 EXE 的构建产物（都由 tool/build.ps1 生成）
+tool/bin/
+tool/obj/
+tool/payload/
+tool/shot-main.png
+tool/shot-main-crop.png

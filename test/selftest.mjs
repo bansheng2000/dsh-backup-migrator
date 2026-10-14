@@ -131,11 +131,17 @@ step("staged 产出 restore.ps1 且内容已解出", () => {
   assert.ok(existsSync(join(staged.dir, "sessions", "ws", "session-a", "session.v4.json")));
   assert.ok(!existsSync(join(staged.dir, "dsh-backup-manifest.json")), "manifest 不该落进暂存区");
   const script = readFileSync(staged.script, "utf8");
+  // 带 BOM 才能被 Windows PowerShell 5.1 当 UTF-8 读，否则中文被按 GBK 拆散直接 ParserError。
+  assert.ok(script.charCodeAt(0) === 0xFEFF, "restore.ps1 必须以 BOM 开头（PS 5.1 读无 BOM UTF-8 会按 GBK 解）");
   assert.ok(script.includes("sessions") && script.includes("memories") && script.includes("profiles"));
   assert.ok(script.includes(target), "脚本里应写明目标数据目录");
   // 换机闭环：脚本最后要自己把插件依赖装回来，否则「备份能导入但插件全缺」。
   assert.ok(script.includes("dsh plugin --profile"), "脚本没装依赖，换机后插件全是坏的");
   assert.ok(script.includes("profiles"), "脚本没遍历 profiles 目录");
+  // .credentials.yaml 是单文件单元：源是文件时 Join-Path $from "*" 通配不到任何东西，
+  // Copy-Item 静默复制 0 个文件，凭据会变成一个同名空目录而且不报错。
+  assert.ok(script.includes("Copy-Item -Path $from -Destination $to -Force"),
+    "脚本没用文件分支还原 .credentials.yaml，凭据会被还原成一个空目录");
 });
 
 const direct = restoreBackup(first.file, "direct", options);
