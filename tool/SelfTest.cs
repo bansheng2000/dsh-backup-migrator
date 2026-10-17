@@ -59,6 +59,46 @@ namespace DshBackupAssistant
             Check("IsInstallDir 接受自己判出的路径", !loc.Usable || PluginInstaller.IsInstallDir(loc.InstallDir), loc.InstallDir);
             Check("没有 DSH 时 profiles 列举不炸", PluginInstaller.Profiles().Any() || !Directory.Exists(PluginInstaller.ProfilesDir));
 
+            Console.WriteLine("[运行时布局：node / pnpm 定位]");
+            // 0.2.1 把 resources\runtime\pnpm 挪进了 primary-runtime\dependencies，
+            // 这里两种布局各造一棵假目录树——用假目录是因为真安装目录装在用户机器上、不能改。
+            var layoutRoot = Path.Combine(Path.GetTempPath(), "dsh-assistant-layout-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var oldLayout = Path.Combine(layoutRoot, "old");
+                Directory.CreateDirectory(Path.Combine(oldLayout, "resources", "runtime", "pnpm", "bin"));
+                Directory.CreateDirectory(Path.Combine(oldLayout, "resources", "runtime", "node", "bin"));
+                Directory.CreateDirectory(Path.Combine(oldLayout, "resources", "app.asar.unpacked"));
+                File.WriteAllText(Path.Combine(oldLayout, "resources", "app.asar"), "stub");
+                File.WriteAllText(Path.Combine(oldLayout, "resources", "runtime", "pnpm", "bin", "pnpm.cjs"), "stub");
+                File.WriteAllText(Path.Combine(oldLayout, "resources", "runtime", "node", "bin", "node.exe"), "stub");
+
+                var newLayout = Path.Combine(layoutRoot, "new");
+                var deps = Path.Combine(newLayout, "resources", "runtime", "primary-runtime", "dependencies");
+                Directory.CreateDirectory(Path.Combine(deps, "pnpm", "bin"));
+                Directory.CreateDirectory(Path.Combine(deps, "node", "bin"));
+                Directory.CreateDirectory(Path.Combine(newLayout, "resources", "app.asar.unpacked"));
+                File.WriteAllText(Path.Combine(newLayout, "resources", "app.asar"), "stub");
+                File.WriteAllText(Path.Combine(deps, "pnpm", "bin", "pnpm.cjs"), "stub");
+                File.WriteAllText(Path.Combine(deps, "node", "bin", "node.exe"), "stub");
+
+                Check("0.2.0 布局（runtime\\pnpm）被认成安装目录", PluginInstaller.IsInstallDir(oldLayout), oldLayout);
+                Check("0.2.1 布局（无 runtime\\pnpm）也被认成安装目录", PluginInstaller.IsInstallDir(newLayout), newLayout);
+                Check("0.2.1 布局下找得到 pnpm",
+                    DepsInstaller.FindPnpm(newLayout) == Path.Combine(deps, "pnpm", "bin", "pnpm.cjs"),
+                    DepsInstaller.FindPnpm(newLayout));
+                Check("0.2.0 布局下找得到 pnpm",
+                    DepsInstaller.FindPnpm(oldLayout) == Path.Combine(oldLayout, "resources", "runtime", "pnpm", "bin", "pnpm.cjs"),
+                    DepsInstaller.FindPnpm(oldLayout));
+                Check("0.2.1 布局下找得到 node",
+                    DepsInstaller.FindNode(newLayout) == Path.Combine(deps, "node", "bin", "node.exe"),
+                    DepsInstaller.FindNode(newLayout));
+            }
+            finally
+            {
+                try { if (Directory.Exists(layoutRoot)) Directory.Delete(layoutRoot, true); } catch { }
+            }
+
             Console.WriteLine("[package.json 补丁]");
             var sample = "{\n  \"name\": \"p\",\n  \"dsh\": { \"profile\": { \"bundles\": [\n    \"a\"\n  ] } },\n  \"dependencies\": {\n    \"b\": \"1\"\n  }\n}\n";
             var patched = InvokePatch(sample);

@@ -575,7 +575,7 @@ namespace DshBackupAssistant
             if (dir == "") return;
             if (!PluginInstaller.IsInstallDir(dir))
             {
-                MessageBox.Show(this, "选中的目录不像 DSH 安装目录。\r\n里面应该有 resources\\app.asar 和 resources\\runtime\\pnpm。",
+                MessageBox.Show(this, "选中的目录不像 DSH 安装目录。\r\n里面应该有 resources\\app.asar 和 resources\\app.asar.unpacked。",
                     "目录不对", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }

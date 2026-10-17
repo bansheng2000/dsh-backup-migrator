@@ -123,14 +123,17 @@ namespace DshBackupAssistant
             if (!string.IsNullOrEmpty(programFiles2)) yield return Path.Combine(programFiles2, "DeepSeek Harness");
         }
 
-        /// <summary>像不像 DSH 安装目录：resources\app.asar + resources\runtime\pnpm + 版本文件，三者齐全才算。</summary>
+        /// <summary>
+        /// 像不像 DSH 安装目录：resources\app.asar + resources\app.asar.unpacked 齐全就算。
+        /// 别拿 resources\runtime\pnpm 当判据——0.2.1 起没这个目录了（pnpm 挪进 primary-runtime\dependencies），
+        /// 用它当条件会把新版本机器上的目录一律拒掉。app.asar.unpacked 两代都有，够区分真安装目录。
+        /// </summary>
         public static bool IsInstallDir(string dir)
         {
             if (string.IsNullOrEmpty(dir)) return false;
             try
             {
                 return File.Exists(Path.Combine(dir, "resources", "app.asar"))
-                    && Directory.Exists(Path.Combine(dir, "resources", "runtime", "pnpm"))
                     && Directory.Exists(Path.Combine(dir, "resources", "app.asar.unpacked"));
             }
             catch

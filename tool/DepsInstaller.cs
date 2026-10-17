@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -14,30 +15,59 @@ namespace DshBackupAssistant
     /// </summary>
     internal static class DepsInstaller
     {
-        /// <summary>找 node：优先 DSH 数据根下自带的 runtimes，再找安装目录里的。</summary>
-        public static string FindNode(string installDir)
+        /// <summary>
+        /// node / pnpm 可能的所在地。两代 DSH 的布局不一样，所以不猜版本、只列位置：
+        ///   0.2.0 及更早：resources\runtime\{node,pnpm}\bin
+        ///   0.2.1 及更新：resources\runtime\primary-runtime\dependencies\{node,pnpm}\bin
+        /// 0.2.1 删掉了顶层 runtime\pnpm，但 primary-runtime 里那份一直都在。
+        /// 数据根下的 dsh-runtimes 兜底：DSH 在这台机器上跑过一次就有。
+        /// </summary>
+        private static IEnumerable<string> RuntimeRoots(string installDir)
         {
+            if (!string.IsNullOrEmpty(installDir))
+            {
+                var runtime = Path.Combine(installDir, "resources", "runtime");
+                yield return runtime;
+                yield return Path.Combine(runtime, "primary-runtime", "dependencies");
+            }
             var runtimes = Path.Combine(App.DataRoot, "dsh-runtimes");
             if (Directory.Exists(runtimes))
             {
                 foreach (var dir in Directory.GetDirectories(runtimes).OrderBy((x) => x, StringComparer.OrdinalIgnoreCase))
                 {
-                    var hit = Path.Combine(dir, "dependencies", "node", "bin", "node.exe");
-                    if (File.Exists(hit)) return hit;
+                    yield return Path.Combine(dir, "dependencies");
                 }
             }
-            var bundled = string.IsNullOrEmpty(installDir)
-                ? ""
-                : Path.Combine(installDir, "resources", "runtime", "node", "bin", "node.exe");
-            return File.Exists(bundled) ? bundled : null;
         }
 
-        /// <summary>找 pnpm：安装目录 resources\runtime\pnpm\bin\pnpm.cjs。</summary>
+        /// <summary>在候选根目录下逐个找 root\a\b\file，第一个存在的胜出。</summary>
+        private static string FirstFile(IEnumerable<string> roots, string a, string b, string file)
+        {
+            foreach (var root in roots)
+            {
+                try
+                {
+                    var hit = Path.Combine(root, a, b, file);
+                    if (File.Exists(hit)) return hit;
+                }
+                catch
+                {
+                    // 路径里有非法字符（候选目录不存在时经常如此）——跳过这个候选就好。
+                }
+            }
+            return null;
+        }
+
+        /// <summary>找 node。</summary>
+        public static string FindNode(string installDir)
+        {
+            return FirstFile(RuntimeRoots(installDir), "node", "bin", "node.exe");
+        }
+
+        /// <summary>找 pnpm。</summary>
         public static string FindPnpm(string installDir)
         {
-            if (string.IsNullOrEmpty(installDir)) return null;
-            var hit = Path.Combine(installDir, "resources", "runtime", "pnpm", "bin", "pnpm.cjs");
-            return File.Exists(hit) ? hit : null;
+            return FirstFile(RuntimeRoots(installDir), "pnpm", "bin", "pnpm.cjs");
         }
 
         public sealed class Result
