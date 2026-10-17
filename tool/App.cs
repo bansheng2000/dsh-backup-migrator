@@ -19,6 +19,7 @@ namespace DshBackupAssistant
     {
         public const string Name = "DSH 备份助手";
         public const string PluginId = "dsh-backup-migrator";
+        /// <summary>默认的 EXE 文件名。只在 SelfPath 兜底猜路径时用——发布产物可能被改名。</summary>
         public const string ExeName = "DSH备份助手.exe";
         public const string StoreDirFileName = "备份目录.txt";
 
@@ -45,7 +46,12 @@ namespace DshBackupAssistant
                 {
                 }
                 if (IsFake(p)) { p = null; try { p = AppContext.BaseDirectory; } catch { } }
-                if (IsFake(p)) p = Process.GetCurrentProcess().MainModule.FileName;
+                // MainModule.FileName 是文件路径不是目录，直接拿它当目录会把文件写到上一层去。
+                if (IsFake(p))
+                {
+                    var exe = ProcessPath();
+                    if (!IsFake(exe)) p = Path.GetDirectoryName(exe);
+                }
                 if (string.IsNullOrEmpty(p)) p = Environment.CurrentDirectory;
                 if (IsInsideDotnetTemp(p)) p = Environment.CurrentDirectory;
                 return Path.GetFullPath(p).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -66,9 +72,26 @@ namespace DshBackupAssistant
             return p.StartsWith(temp, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// 这个 EXE 自己的完整路径。不能拼死文件名：发布产物会被改名成
+        /// DSH-Backup-Assistant-0.3.0-win-x64.exe，用户按下载名运行时拼死的名字根本不存在
+        /// （Restore.CopySelf 会 FileNotFoundException）。
+        /// </summary>
         public static string SelfPath
         {
-            get { return Path.Combine(SelfDir, ExeName); }
+            get
+            {
+                var p = ProcessPath();
+                return IsFake(p) ? Path.Combine(SelfDir, ExeName) : Path.GetFullPath(p);
+            }
+        }
+
+        /// <summary>当前进程的可执行文件路径。单文件发布时 Assembly.Location 是 :memory:，只能问进程。</summary>
+        public static string ProcessPath()
+        {
+            var p = Environment.ProcessPath;
+            if (!IsFake(p)) return p;
+            try { return Process.GetCurrentProcess().MainModule?.FileName; } catch { return null; }
         }
 
         public static string DataRoot
@@ -121,14 +144,18 @@ namespace DshBackupAssistant
             get { return Path.Combine(SelfDir, "dsh-backup-assistant.log"); }
         }
 
-        /// <summary>EXE 内嵌插件的解压目录。放 EXE 旁边，package.json 里就能写 file: 绝对路径。</summary>
+        /// <summary>
+        /// 内嵌插件的解压目录。刻意放数据根下的固定位置，不放 EXE 旁边：
+        /// EXE 会跟着备份目录搬家（Restore.CopySelf），搬走后 profile 里的 file: 依赖就指向旧目录了。
+        /// </summary>
         public static string PayloadDir
         {
-            get { return Path.Combine(SelfDir, "plugin"); }
+            get { return Path.Combine(DataRoot, ".backup-migrator-plugin"); }
         }
 
         /// <summary>
-        /// 把 EXE 资源里的插件解压出来。已存在就跳过——解压一次不到 1MB，没必要每次启动都做。
+        /// 把 EXE 资源里的插件解压出来，每次都覆盖解一遍：目录位置是稳定的，内容得跟当前这个 EXE 一致
+        /// （否则换了新版 EXE，profile 里那条 file: 依赖拿到的还是旧插件）。不到 1MB，重解不心疼。
         /// 解压失败不当致命错误：备份导入不依赖它，只有"装插件"这一项会用到。
         /// </summary>
         public static string EnsurePayload(out string problem)
@@ -137,28 +164,25 @@ namespace DshBackupAssistant
             var dir = PayloadDir;
             try
             {
-                if (!File.Exists(Path.Combine(dir, "package.json")))
+                using (var stream = typeof(App).Assembly.GetManifestResourceStream("DshBackupAssistant.Payload.zip"))
                 {
-                    using (var stream = typeof(App).Assembly.GetManifestResourceStream("DshBackupAssistant.Payload.zip"))
+                    if (stream == null)
                     {
-                        if (stream == null)
+                        problem = "这个 EXE 里没有内嵌插件（构建时漏了 payload），装插件功能不可用；备份导入仍可正常使用。";
+                        return dir;
+                    }
+                    using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
+                    {
+                        foreach (var entry in zip.Entries)
                         {
-                            problem = "这个 EXE 里没有内嵌插件（构建时漏了 payload），装插件功能不可用；备份导入仍可正常使用。";
-                            return dir;
-                        }
-                        using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
-                        {
-                            foreach (var entry in zip.Entries)
-                            {
-                                if (entry.FullName.EndsWith("/", StringComparison.Ordinal)) continue;
-                                var to = Path.Combine(dir, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
-                                Directory.CreateDirectory(Path.GetDirectoryName(to));
-                                entry.ExtractToFile(to, true);
-                            }
+                            if (entry.FullName.EndsWith("/", StringComparison.Ordinal)) continue;
+                            var to = Path.Combine(dir, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
+                            Directory.CreateDirectory(Path.GetDirectoryName(to));
+                            entry.ExtractToFile(to, true);
                         }
                     }
-                    Log.Write("info", "已解出内嵌插件到 " + dir);
                 }
+                Log.Write("info", "已解出内嵌插件到 " + dir);
             }
             catch (Exception error)
             {

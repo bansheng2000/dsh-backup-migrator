@@ -7,15 +7,19 @@
 //  2. manifest 与数据在同一个归档里，且能被 tar -xOf 读出来。
 //  3. 换机语义：把一份备份 direct 还原到「另一台机器」的数据目录。
 //  4. 损坏 / 非本插件的文件必须在校验阶段被拒，不能还原。
-//  5. keepCount 生效、手动删除生效。
+//  5. 保留策略三个维度（份数 / 天数 / 占用）都生效，手动删除生效。
+//  6. 还原前的空间检查：够不够要用 manifest 声明的原始体积算，不够就一个文件都不写。
+//  7. WebDAV 云端上传 / 下载 / 列目录（用假 fetch，不真连网）。
+//  8. 卸载：profile 的 package.json 改写是纯函数，落盘后包目录真被删掉。
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { Readable } from "node:stream";
+import { join, resolve } from "node:path";
 
 const tmp = mkdtempSync(join(tmpdir(), "bm-selftest-"));
 const source = join(tmp, "source");          // 「旧电脑」的数据目录
@@ -40,20 +44,42 @@ put(join(source, ".credentials.yaml"), "token: secret");
 
 process.env.DSH_DATA_DIR = source;
 
-const { createBackup, deleteBackup, inspectBackup, itemsOf, listBackups,
-  prune, readManifest, restoreBackup, dataRootOf, storeDirOf, defaultOptions, scan } =
+const { createBackup, deleteBackup, exportBackup, inspectBackup, itemsOf, listBackupFiles, listBackups,
+  prune, readManifest, restoreBackup, dataRootOf, storeDirOf, defaultOptions, scan,
+  checkSpace, dshVersionOf, freeBytesOf, needBytesOf, rememberDshVersion } =
   await import("../lib/backup.js");
+const { cloudDownload, cloudList, cloudUpload, cloudOf, parsePropfind, remoteUrl, authHeaders, CLOUD_BACKUP_NAME } =
+  await import("../lib/cloud.js");
+const { findProfiles, planUninstall, uninstallProfile } = await import("../lib/uninstall.js");
 
 const steps = [];
-function step(name, fn) {
-  try {
-    fn();
+function record(name, error) {
+  if (error === undefined) {
     steps.push("  ok   " + name);
-  } catch (error) {
+  } else {
     steps.push("  FAIL " + name + "\n       " + String(error?.message ?? error).split("\n")[0]);
     process.exitCode = 1;
   }
 }
+
+function step(name, fn) {
+  try {
+    fn();
+    record(name);
+  } catch (error) {
+    record(name, error);
+  }
+}
+
+async function stepAsync(name, fn) {
+  try {
+    await fn();
+    record(name);
+  } catch (error) {
+    record(name, error);
+  }
+}
+
 
 const options = { ...defaultOptions(), storeDir: store, items: ["sessions", "memories", "profiles"] };
 
@@ -75,6 +101,11 @@ step("数据目录 / 备份目录推导", () => {
 // ---- 2. 打包 -----------------------------------------------------------------
 const first = await createBackup(options);
 steps.push("  ok   打出 zip：" + first.name + "（" + first.bytes + " B）");
+
+// 后面几步（版本 / 云端）还要用一份归档，可保留策略那两步会把 store 清空，先留一份在旁边。
+const keptFile = join(tmp, "kept", first.name);
+mkdirSync(join(tmp, "kept"), { recursive: true });
+writeFileSync(keptFile, readFileSync(first.file));
 
 const entries = String(execFileSync("tar", ["-tf", first.file], { encoding: "utf8" }));
 step("归档含 manifest + 勾选内容", () => {
@@ -153,6 +184,26 @@ step("direct 把内容落到目标数据目录", () => {
   assert.ok(!existsSync(join(target, "dsh-backup-manifest.json")), "manifest 不该写进数据目录");
 });
 
+step("direct 再还原一次：先挪开旧内容再覆盖，不留 .pre-restore 残渣", () => {
+  // 覆盖前把要替换的顶层项挪到一边，是「导入失败能回滚」和「DSH 开着就拒绝还原」的同一套机制：
+  // 宿主还攥着会话文件句柄时目录搬不动，rename 直接抛错。
+  const again = restoreBackup(first.file, "direct", options);
+  assert.ok(again.replaced.includes("sessions"), "应挪开已有的 sessions：" + again.replaced);
+  assert.deepEqual(readdirSync(target).filter((n) => n.startsWith(".pre-restore-")),
+    [], "回滚点用完必须删掉，别留在数据目录里");
+  assert.ok(existsSync(join(target, "sessions", "ws", "session-a", "session.v4.json")));
+});
+
+step("导出撞名不覆盖，自动加序号", () => {
+  // 覆盖式导出会让「上一次拷到 U 盘那份」静默消失——备份工具不该有这种默认语义。
+  const dest = join(tmp, "out", "copy.zip");
+  const one = exportBackup(options, first.name, dest);
+  const two = exportBackup(options, first.name, dest);
+  assert.equal(one.to, resolve(dest));
+  assert.equal(two.to, resolve(dest).replace(/\.zip$/, "-2.zip"));
+  assert.ok(existsSync(one.to) && existsSync(two.to), "两份都要在");
+});
+
 // ---- 5. tar.gz 也能走通 ------------------------------------------------------
 const tgz = await createBackup({ ...options, format: "tgz" });
 step("tar.gz 打包 + 校验", () => {
@@ -226,6 +277,187 @@ step("选文件夹走宿主原生对话框，并留了手动填的退路", () =>
   // 备份目录与导出目的地都要能点选，两个入口都在。
   assert.equal((source.match(/chooseDir\("选目录中"/g) ?? []).length, 2, "备份目录与导出目的地两个入口都要能点选");
   assert.ok(!source.includes("插件弹不了系统文件选择框"), "过时的说明文案没删");
+});
+
+// ---- 8. 保留策略的三个维度 ---------------------------------------------------
+step("保留策略：天数 / 占用 / 份数各自生效，protect 豁免刚打出来的那份", () => {
+  const dir = join(tmp, "policy");
+  mkdirSync(dir, { recursive: true });
+  const names = ["a", "b", "c", "d"].map((tag) => "dsh-backup-20260101-00000" + tag + ".zip");
+  for (const name of names) writeFileSync(join(dir, name), "x".repeat(1000));
+  const stale = new Date(Date.now() - 30 * 86400000);
+  utimesSync(join(dir, names[0]), stale, stale);
+  utimesSync(join(dir, names[1]), new Date(stale.getTime() + 60000), new Date(stale.getTime() + 60000));
+
+  const byDays = prune(dir, { keep: 99, days: 7, bytes: 0 });
+  assert.equal(byDays.removed, 2, "超过 7 天的两份该走：" + JSON.stringify(byDays));
+  assert.equal(listBackupFiles(dir).length, 2, "天数维度：该只剩 2 份");
+
+  const byBytes = prune(dir, { keep: 99, days: 0, bytes: 1500 });
+  assert.equal(byBytes.removed, 1, "1000 B/份、上限 1500 B 只能留 1 份：" + JSON.stringify(byBytes));
+  assert.equal(listBackupFiles(dir).length, 1, "占用维度");
+  assert.equal(prune(dir, { keep: 99, days: 0, bytes: 0 }).removed, 0, "两个维度都是 0 = 不限，不该删");
+
+  writeFileSync(join(dir, "dsh-backup-20260101-00000e.zip"), "y".repeat(1000));
+  const sorted = listBackupFiles(dir);
+  assert.equal(sorted.length, 2);
+  assert.equal(prune(dir, { keep: 1 }, sorted[1]).removed, 0, "protect 里的那份必须豁免，否则新包会删掉自己");
+  assert.equal(prune(dir, 1).removed, 1, "数字形态（只限份数）仍要兼容");
+});
+
+// ---- 9. 还原前的空间检查 -----------------------------------------------------
+step("空间需求：manifest 声明的原始体积优先，老包退回按归档估", () => {
+  assert.equal(needBytesOf({ unpackedBytes: 1000 }, 999999), 1100, "有声明就用声明，另留 10% 余量");
+  assert.equal(needBytesOf({}, 1000), 2750, "老包没声明就按归档 ×2.5 再留 10%");
+  const free = freeBytesOf(target);
+  assert.ok(free === null || free > 0, "查得到就得是正数，查不到是 null：" + free);
+  assert.equal(checkSpace(target, { unpackedBytes: 1024 }, 1024).ok, true, "1 KB 总装得下");
+  const huge = checkSpace(target, { unpackedBytes: 1024 ** 5 }, 1);
+  assert.equal(huge.ok, false, "1 PB 应该被拒：" + JSON.stringify(huge));
+  assert.ok(typeof huge.free === "number", "被拒时要报得出可用空间");
+});
+
+step("空间不够时，还原阶段一个文件都不写", () => {
+  const dir = join(tmp, "space");
+  put(join(dir, "sessions", "s.json"), "{}");
+  writeFileSync(join(dir, "dsh-backup-manifest.json"), JSON.stringify({
+    plugin: "dsh-backup-migrator", pluginVersion: "test", schema: 1, createdAt: new Date().toISOString(),
+    format: "zip", sourceRoot: source, profile: "desktop", items: ["sessions"], expectedFiles: 1,
+    missing: [], unpackedBytes: 1024 ** 5, note: "test",
+  }));
+  const file = join(tmp, "huge.zip");
+  execFileSync("tar", ["--format", "zip", "-cf", file, "-C", dir, "./sessions", "./dsh-backup-manifest.json"], { stdio: "ignore" });
+  const victim = join(tmp, "space-target");
+  process.env.DSH_DATA_DIR = victim;
+  try {
+    assert.throws(() => restoreBackup(file, "direct", options), /空间不足/);
+    assert.ok(!existsSync(victim), "被拒时不该建目标目录，更不该写文件");
+  } finally {
+    process.env.DSH_DATA_DIR = target;
+  }
+});
+
+// ---- 10. manifest 里的 DSH 版本 ----------------------------------------------
+step("manifest 记下 DSH 版本；面板报回来的值最优先", () => {
+  const blank = dshVersionOf({});
+  assert.equal(typeof blank, "string", "版本号应是字符串");
+  const back = readManifest(keptFile);
+  assert.equal(typeof back.dsh, "string", "manifest 要有 dsh 字段");
+  assert.ok(back.unpackedBytes > 0, "manifest 要记下原始体积，空间检查靠它：" + back.unpackedBytes);
+  rememberDshVersion("9.9.9-test");
+  assert.equal(dshVersionOf({}), "9.9.9-test", "面板报回来的值最优先");
+  assert.equal(dshVersionOf({ DSH_VERSION: "1.2.3" }), "9.9.9-test", "已经报过一次就不该被环境变量顶掉");
+});
+
+// ---- 11. WebDAV 云端备份（假 fetch，不连网）-----------------------------------
+step("WebDAV 地址拼装 / Basic 认证头 / 中文目录与文件名都转义", () => {
+  const cloud = cloudOf({ cloudUrl: "https://dav.jianguoyun.com/dav/", cloudDir: "dsh 备份/子目录", cloudUser: "u", cloudPass: "p" });
+  assert.equal(cloud.base, "https://dav.jianguoyun.com/dav", "末尾斜杠要去掉");
+  assert.equal(authHeaders(cloud).authorization, "Basic " + Buffer.from("u:p").toString("base64"));
+  const url = remoteUrl(cloud, "dsh-backup-20260101-000000.zip");
+  assert.ok(url.includes(encodeURIComponent("dsh 备份") + "/" + encodeURIComponent("子目录")), "目录段要转义：" + url);
+  assert.ok(url.endsWith("/dsh-backup-20260101-000000.zip"));
+  assert.throws(() => cloudOf({ cloudUrl: "" }), /请先填写 WebDAV 地址/);
+  assert.ok(CLOUD_BACKUP_NAME.test("dsh-backup-20260101-000000.zip"), "备份名要认");
+  assert.ok(!CLOUD_BACKUP_NAME.test("readme.txt"), "别人的文件不要列进去");
+});
+
+step("WebDAV 列目录：解析 PROPFIND，跳掉目录自身与子目录", () => {
+  const xml = [
+    '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">',
+    '<d:response><d:href>/dav/bk/</d:href></d:response>',
+    '<d:response><d:href>/dav/bk/sub/</d:href></d:response>',
+    '<d:response><d:href>/dav/bk/dsh-backup-20260101-000000.zip</d:href>',
+    '<d:propstat><d:prop><d:getcontentlength>1024</d:getcontentlength>',
+    '<d:getlastmodified>Fri, 02 Jan 2026 03:04:05 GMT</d:getlastmodified></d:prop></d:propstat></d:response>',
+    '<d:response><d:href>/dav/bk/readme.txt</d:href></d:response>',
+    "</d:multistatus>",
+  ].join("");
+  const rows = parsePropfind(xml, "bk");
+  assert.deepEqual(rows.map((r) => r.name).sort(), ["dsh-backup-20260101-000000.zip", "readme.txt"],
+    "目录自身与子目录都要跳过：" + JSON.stringify(rows));
+  assert.ok(JSON.stringify(rows[0]).includes("1024"), "要带上体积：" + JSON.stringify(rows[0]));
+});
+
+await stepAsync("WebDAV 上传 / 列目录 / 下载：撞名不覆盖本地唯一一份", async () => {
+  // 假 fetch 顶掉全局，字节留在内存里，一点网都不连。
+  const jar = new Map();
+  const fakeFetch = async (url, init = {}) => {
+    const method = String(init.method ?? "GET").toUpperCase();
+    const key = decodeURIComponent(String(url).split("/").pop());
+    if (method === "PROPFIND") {
+      const body = [...jar.keys()].map((n) => '<d:response><d:href>/dav/bk/' + encodeURIComponent(n)
+        + '</d:href><d:propstat><d:prop><d:getcontentlength>' + jar.get(n).length
+        + "</d:getcontentlength></d:prop></d:propstat></d:response>").join("");
+      return { ok: true, status: 207, text: async () => '<d:multistatus xmlns:d="DAV:">' + body + "</d:multistatus>" };
+    }
+    if (method === "PUT") {
+      const chunks = [];
+      for await (const chunk of init.body) chunks.push(chunk);
+      jar.set(key, Buffer.concat(chunks));
+      return { ok: true, status: 201, text: async () => "" };
+    }
+    if (method === "GET") {
+      const bytes = jar.get(key);
+      if (bytes === undefined) return { ok: false, status: 404, text: async () => "not found" };
+      return { ok: true, status: 200, body: Readable.toWeb(Readable.from([bytes])), text: async () => "" };
+    }
+    return { ok: false, status: 405, text: async () => "nope" };
+  };
+  const cloudOptions = { ...options, cloudUrl: "https://dav.example.com/dav", cloudDir: "bk", cloudUser: "u", cloudPass: "p" };
+  const name = "dsh-backup-20260101-000000.zip";
+
+  await cloudUpload(cloudOptions, keptFile, name, fakeFetch);
+  assert.ok(jar.has(name), "PUT 没发出去");
+  assert.equal(jar.get(name).length, readFileSync(keptFile).length, "传上去的字节数要和本地一致");
+
+  const rows = await cloudList(cloudOptions, fakeFetch);
+  assert.equal(rows.length, 1, "云端列表：" + JSON.stringify(rows));
+  assert.equal(rows[0].name, name);
+
+  const dest = join(tmp, "cloud-down");
+  mkdirSync(dest, { recursive: true });
+  await cloudDownload(cloudOptions, name, dest, fakeFetch);
+  assert.equal(readdirSync(dest).length, 1, "下载应落一份：" + readdirSync(dest).join(","));
+  assert.equal(readFileSync(join(dest, readdirSync(dest)[0])).length, readFileSync(keptFile).length, "下载内容不完整");
+  await cloudDownload(cloudOptions, name, dest, fakeFetch);
+  assert.equal(readdirSync(dest).length, 2, "撞名要加序号，不能覆盖本地唯一一份：" + readdirSync(dest).join(","));
+});
+
+// ---- 12. 卸载 -----------------------------------------------------------------
+step("卸载：package.json 改写是纯函数，落盘后包目录真被删掉", () => {
+  const root = join(tmp, "un-root");
+  const profile = join(root, "profiles", "desktop");
+  mkdirSync(join(profile, "node_modules", "dsh-backup-migrator", "lib"), { recursive: true });
+  writeFileSync(join(profile, "node_modules", "dsh-backup-migrator", "lib", "index.js"), "// plugin");
+  writeFileSync(join(profile, "package.json"), JSON.stringify({
+    name: "desktop",
+    dependencies: { "dsh-backup-migrator": "file:E:/x/dsh-backup-migrator", "dsh-task-notify": "file:E:/x/t" },
+    dsh: { profile: { bundles: ["dsh-backup-migrator", "dsh-task-notify"] } },
+  }, null, 2) + "\n");
+
+  const found = findProfiles(root);
+  assert.equal(found.length, 1, "应认出装过本插件的 profile：" + JSON.stringify(found));
+  const plan = planUninstall(found[0]);
+  assert.equal(plan.before, readFileSync(plan.file, "utf8"), "before 要是改写前的原文");
+  assert.ok(!plan.after.includes("dsh-backup-migrator"), "改后的文本里不该再有本插件");
+  assert.ok(plan.after.includes("dsh-task-notify"), "别人的插件不能被顺手删掉");
+  assert.equal(JSON.parse(plan.after).dsh.profile.bundles.length, 1);
+
+  uninstallProfile(found[0], "20260101-000000");
+  assert.ok(existsSync(join(profile, "package.json.bak-20260101-000000")), "改写前要先备份 package.json");
+  assert.ok(!existsSync(join(profile, "node_modules", "dsh-backup-migrator")), "包目录应被删掉");
+  assert.ok(!readFileSync(join(profile, "package.json"), "utf8").includes("dsh-backup-migrator"));
+  assert.deepEqual(findProfiles(root), [], "卸完就该认不出来了");
+  assert.deepEqual(findProfiles(join(tmp, "nope")), [], "没有 profiles 目录时给空数组，不抛错");
+});
+
+step("面板接上了新功能的入口", () => {
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  for (const token of ["/cloud/list", "/cloud/upload", "/cloud/download", "/uninstall",
+    "/notify-targets", "probeVersion", "keepDays", "keepBytesGb", "notifyOnFailure"]) {
+    assert.ok(client.includes(token), "面板里缺 " + token);
+  }
 });
 
 console.log("dsh-backup-migrator selftest");

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace DshBackupAssistant
@@ -17,6 +18,7 @@ namespace DshBackupAssistant
         private readonly Label _dshFound = new Label();
         private readonly Label _status = new Label();
         private readonly Button _install = new Button();
+        private readonly Button _uninstall = new Button();
         private readonly Button _browseDsh = new Button();
         private readonly Button _browseStore = new Button();
         private readonly Button _applyStore = new Button();
@@ -89,9 +91,10 @@ namespace DshBackupAssistant
         private GroupBox BuildInstallGroup()
         {
             var box = new GroupBox { Text = "一、把插件装到这台电脑", Dock = DockStyle.Fill, AutoSize = true, Padding = new System.Windows.Forms.Padding(10) };
-            var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 3, AutoSize = true };
+            var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, RowCount = 3, AutoSize = true };
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
@@ -99,7 +102,7 @@ namespace DshBackupAssistant
             _dshFound.AutoSize = true;
             _dshFound.Margin = new System.Windows.Forms.Padding(0, 3, 0, 6);
             grid.Controls.Add(_dshFound, 0, 0);
-            grid.SetColumnSpan(_dshFound, 4);
+            grid.SetColumnSpan(_dshFound, 5);
 
             grid.Controls.Add(new Label { Text = "DSH 安装目录：", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new System.Windows.Forms.Padding(0, 3, 6, 3) }, 0, 1);
             _dshDir.Dock = DockStyle.Fill;
@@ -113,6 +116,10 @@ namespace DshBackupAssistant
             _install.AutoSize = true;
             _install.Click += OnInstall;
             grid.Controls.Add(_install, 3, 1);
+            _uninstall.Text = "卸载插件…";
+            _uninstall.AutoSize = true;
+            _uninstall.Click += OnUninstall;
+            grid.Controls.Add(_uninstall, 4, 1);
 
             grid.Controls.Add(new Label { Text = "目标 profile：", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new System.Windows.Forms.Padding(0, 3, 6, 3) }, 0, 2);
             _profile.Dock = DockStyle.Fill;
@@ -201,6 +208,7 @@ namespace DshBackupAssistant
             _backups.Columns.Add("文件名", 260);
             _backups.Columns.Add("备份时间", 140);
             _backups.Columns.Add("大小", 90);
+            _backups.Columns.Add("DSH 版本", 90);
             _backups.Columns.Add("内容", 220);
             _backups.SelectedIndexChanged += OnBackupSelected;
             grid.Controls.Add(_backups, 0, 0);
@@ -258,10 +266,13 @@ namespace DshBackupAssistant
                 {
                     string time = "?";
                     string what = "";
+                    // 老备份没有 dsh 字段，空串就是「没探到」，显示成未知而不是留白。
+                    string dsh = "未知";
                     try
                     {
                         var manifest = BackupFile.ReadManifest(file);
                         time = BackupFile.DescribeTime(manifest.CreatedAt);
+                        dsh = manifest.Dsh == "" ? "未知" : manifest.Dsh;
                         what = string.Join("、", manifest.Items.Select(BackupFile.ItemLabel));
                     }
                     catch (Exception error)
@@ -271,6 +282,7 @@ namespace DshBackupAssistant
                     var row = new ListViewItem(Path.GetFileName(file));
                     row.SubItems.Add(time);
                     row.SubItems.Add(BackupFile.DescribeSize(BackupFile.Size(file)));
+                    row.SubItems.Add(dsh);
                     row.SubItems.Add(what);
                     row.Tag = file;
                     _backups.Items.Add(row);
@@ -381,13 +393,16 @@ namespace DshBackupAssistant
             }
         }
 
-        private void PrepareImport(string file)
+        private async void PrepareImport(string file)
         {
             try
             {
                 var plan = Restore.Analyze(file);
                 _import.Tag = plan;
                 _import.Enabled = true;
+                // 校验通过才让「解到暂存区」可用：原先只能靠 OnStage 的 finally 打开，
+                // 而按钮一开始就是灰的，那条路根本走不到。
+                _stage.Enabled = true;
                 _status.Text = "已校验：" + Path.GetFileName(file) + "（" + BackupFile.DescribeSize(plan.Bytes)
                     + "，" + BackupFile.DescribeTime(plan.Manifest.CreatedAt) + "）";
                 _status.ForeColor = System.Drawing.Color.DarkGreen;
@@ -397,6 +412,7 @@ namespace DshBackupAssistant
                 body.AppendLine("备份时间：" + BackupFile.DescribeTime(plan.Manifest.CreatedAt));
                 body.AppendLine("备份内容：" + string.Join("、", plan.Manifest.Items.Select(BackupFile.ItemLabel)));
                 body.AppendLine("将写入：" + App.DataRoot);
+                body.AppendLine("空间：" + SpaceLine(plan));
                 if (plan.WillOverwrite)
                 {
                     body.AppendLine();
@@ -417,6 +433,7 @@ namespace DshBackupAssistant
                 {
                     _import.Tag = null;
                     _import.Enabled = false;
+                    _stage.Enabled = false;
                     _status.Text = "已取消导入。";
                     return;
                 }
@@ -426,14 +443,16 @@ namespace DshBackupAssistant
                         "DSH 还在运行", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     _import.Tag = null;
                     _import.Enabled = false;
+                    _stage.Enabled = false;
                     return;
                 }
                 _status.Text = "正在导入…";
                 _import.Enabled = false;
+                _stage.Enabled = false;
                 _backups.Enabled = false;
                 Refresh();
-                Application.DoEvents();
-                Restore.Apply(plan);
+                // 解包是分钟级 IO，留在 UI 线程上窗口就是「未响应」。
+                await Task.Run(() => Restore.Apply(plan));
                 _status.Text = "导入完成：" + string.Join("、", plan.Targets) + "。重启 DSH 后生效。";
                 _status.ForeColor = System.Drawing.Color.DarkGreen;
                 RefreshBackups();
@@ -445,17 +464,20 @@ namespace DshBackupAssistant
                 {
                     _status.Text = "正在装依赖…";
                     Refresh();
-                    Application.DoEvents();
                     var installDir = _dshDir.Text.Trim();
                     var done = new System.Text.StringBuilder();
                     var failed = new System.Text.StringBuilder();
-                    foreach (var dir in PluginInstaller.Profiles())
+                    // pnpm install 是分钟级网络操作，同样不能压在 UI 线程上。
+                    await Task.Run(() =>
                     {
-                        var name = Path.GetFileName(dir);
-                        var deps = DepsInstaller.Install(installDir, name);
-                        if (deps.Ran && deps.ExitCode == 0) done.Append(name + " ");
-                        else failed.Append(name + "（" + (deps.Reason == "" ? "退出码 " + deps.ExitCode : deps.Reason) + "）");
-                    }
+                        foreach (var dir in PluginInstaller.Profiles())
+                        {
+                            var name = Path.GetFileName(dir);
+                            var deps = DepsInstaller.Install(installDir, name);
+                            if (deps.Ran && deps.ExitCode == 0) done.Append(name + " ");
+                            else failed.Append(name + "（" + (deps.Reason == "" ? "退出码 " + deps.ExitCode : deps.Reason) + "）");
+                        }
+                    });
                     _status.Text = done.Length > 0 || failed.Length == 0
                         ? "依赖装好了：" + done.ToString().Trim()
                         : "依赖没装上：" + failed.ToString();
@@ -467,6 +489,8 @@ namespace DshBackupAssistant
                 Log.Write("error", "导入失败：" + error);
                 _import.Tag = null;
                 _import.Enabled = false;
+                _stage.Enabled = false;
+                _backups.Enabled = _backups.Items.Count > 0;
                 _status.Text = "导入失败：" + Log.Friendly(error);
                 _status.ForeColor = System.Drawing.Color.Firebrick;
                 MessageBox.Show(this, "导入失败：\r\n" + Log.Friendly(error)
@@ -474,7 +498,78 @@ namespace DshBackupAssistant
             }
         }
 
-        private void OnInstall(object sender, EventArgs e)
+        /// <summary>「需要约 X，目标盘可用 Y」——真不够时 Analyze 已经拦下了，这行只是让用户看清这笔账。</summary>
+        private static string SpaceLine(Restore.Plan plan)
+        {
+            var free = Restore.FreeBytes(App.DataRoot);
+            return "需要约 " + BackupFile.DescribeSize(Restore.RequiredBytes(plan))
+                + "，目标盘可用 " + (free < 0 ? "未知" : BackupFile.DescribeSize(free));
+        }
+
+        /// <summary>
+        /// 卸载：只动 profile 里的 package.json 与 node_modules\包名。
+        /// 数据根下那份插件解压目录留着——下次装还要用，删了等于让插件安装重新解一遍。
+        /// </summary>
+        private void OnUninstall(object sender, EventArgs e)
+        {
+            string profile;
+            try
+            {
+                profile = PluginInstaller.FindInstalledProfile(PluginInstaller.ProfilesDir);
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(this, "找 profile 失败：\r\n" + Log.Friendly(error), "卸载插件",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            if (profile == null)
+            {
+                MessageBox.Show(this, "没找到装过本插件的 profile。\r\n扫的是：" + PluginInstaller.ProfilesDir,
+                    "卸载插件", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var body = new System.Text.StringBuilder();
+            body.AppendLine("将从下面这个 profile 里卸掉 " + App.PluginId + "：");
+            body.AppendLine("　" + profile);
+            body.AppendLine();
+            body.AppendLine("会做的事：");
+            body.AppendLine("· 把 package.json 先备份成 package.json.bak-<时间戳>");
+            body.AppendLine("· 从 dsh.profile.bundles 与 dependencies 里摘掉它");
+            body.AppendLine("· 删掉 node_modules\\" + App.PluginId + "（是链接就只删链接，不跟进去）");
+            body.AppendLine();
+            body.AppendLine("建议先完全退出 DSH，否则文件可能被占着删不掉。继续？");
+            if (MessageBox.Show(this, body.ToString(), "确认卸载", MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK)
+            {
+                return;
+            }
+            try
+            {
+                _uninstall.Enabled = false;
+                var result = PluginInstaller.Uninstall();
+                _status.Text = "已卸载：" + result.Profile + "。重启 DSH 生效。";
+                _status.ForeColor = System.Drawing.Color.DarkGreen;
+                MessageBox.Show(this, "已卸载，重启 DSH 生效。\r\n\r\nprofile：" + result.Profile
+                    + "\r\npackage.json 原文件备份在：" + result.Backup
+                    + (result.RemovedLink ? "\r\n（node_modules 里那条是链接，只删了链接本身）" : ""),
+                    "卸载完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception error)
+            {
+                Log.Write("error", "卸载失败：" + error);
+                _status.Text = "卸载失败：" + Log.Friendly(error);
+                _status.ForeColor = System.Drawing.Color.Firebrick;
+                MessageBox.Show(this, "卸载失败：\r\n" + Log.Friendly(error) + "\r\n\r\n详情见日志：" + App.LogFile,
+                    "卸载失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                _uninstall.Enabled = true;
+            }
+        }
+
+        private async void OnInstall(object sender, EventArgs e)
         {
             var dir = _dshDir.Text.Trim();
             if (dir == "") return;
@@ -499,12 +594,10 @@ namespace DshBackupAssistant
                 _install.Enabled = false;
                 _status.Text = "正在安装…";
                 Refresh();
-                Application.DoEvents();
-                var result = PluginInstaller.Install(dir, profile);
+                var result = await Task.Run(() => PluginInstaller.Install(dir, profile));
                 _status.Text = "插件文件已就位，正在装依赖…";
                 Refresh();
-                Application.DoEvents();
-                var deps = DepsInstaller.Install(dir, profile);
+                var deps = await Task.Run(() => DepsInstaller.Install(dir, profile));
                 var tail = deps.Ran && deps.ExitCode == 0
                     ? "依赖也装好了。"
                     : "依赖没能自动装上（" + (deps.Reason == "" ? "退出码 " + deps.ExitCode : deps.Reason)

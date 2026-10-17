@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace DshBackupAssistant
 {
@@ -85,12 +86,17 @@ namespace DshBackupAssistant
                 };
                 using (var proc = Process.Start(psi))
                 {
-                    var output = proc.StandardOutput.ReadToEnd();
-                    var error = proc.StandardError.ReadToEnd();
-                    proc.WaitForExit();
+                    // pnpm 的输出量很容易超过管道缓冲，必须两个流同时开始收：顺序 ReadToEnd 会死锁。
+                    var output = new StringBuilder();
+                    var error = new StringBuilder();
+                    proc.OutputDataReceived += (s, x) => { if (x.Data != null) output.AppendLine(x.Data); };
+                    proc.ErrorDataReceived += (s, x) => { if (x.Data != null) error.AppendLine(x.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                    proc.WaitForExit();   // 无参重载会等两个异步读取都收到 EOF 才返回
                     result.Ran = true;
                     result.ExitCode = proc.ExitCode;
-                    result.Output = (output + "\n" + error).Trim();
+                    result.Output = (output.ToString() + "\n" + error.ToString()).Trim();
                 }
             }
             catch (Exception error)

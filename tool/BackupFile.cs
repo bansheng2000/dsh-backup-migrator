@@ -18,10 +18,14 @@ namespace DshBackupAssistant
         public int Schema;
         public string CreatedAt = "";
         public string Format = "zip";
+        /// <summary>备份那台机器的 DSH 版本，探不到就是空串。老备份没有这个字段。</summary>
+        public string Dsh = "";
         public string SourceRoot = "";
         public string Profile = "";
         public string[] Items = new string[0];
         public int ExpectedFiles;
+        /// <summary>解压后的原始字节数，还原前按它做空间检查。老备份没有这个字段（= 0），回退到按包大小估。</summary>
+        public long UnpackedBytes;
         public string[] Missing = new string[0];
         public string Note = "";
 
@@ -37,10 +41,15 @@ namespace DshBackupAssistant
                     Schema = root.TryGetProperty("schema", out var s) && s.TryGetInt32(out var n) ? n : 0,
                     CreatedAt = Str(root, "createdAt"),
                     Format = Str(root, "format") ?? "zip",
+                    Dsh = Str(root, "dsh") ?? "",
                     SourceRoot = Str(root, "sourceRoot"),
                     Profile = Str(root, "profile"),
                     Items = Arr(root, "items"),
                     ExpectedFiles = root.TryGetProperty("expectedFiles", out var e) && e.TryGetInt32(out var c) ? c : 0,
+                    // 缺失或类型不对都当 0：老备份没有这个字段，0 表示「按包大小估」。
+                    // 必须先看 ValueKind——TryGetInt64 拿到非 Number 会抛 InvalidOperationException，不是返回 false。
+                    UnpackedBytes = root.TryGetProperty("unpackedBytes", out var u)
+                        && u.ValueKind == JsonValueKind.Number && u.TryGetInt64(out var b) ? b : 0,
                     Missing = Arr(root, "missing"),
                     Note = Str(root, "note"),
                 };
@@ -165,14 +174,20 @@ namespace DshBackupAssistant
             };
             using (var proc = Process.Start(psi))
             {
-                string output = proc.StandardOutput.ReadToEnd();
-                string error = proc.StandardError.ReadToEnd();
-                proc.WaitForExit();
+                // 两个管道都必须在等退出之前就开始读：先 ReadToEnd(stdout) 再读 stderr，
+                // stderr 那 4KB 缓冲一满子进程就卡在写，父进程卡在读，双方永久挂死。
+                var output = new StringBuilder();
+                var error = new StringBuilder();
+                proc.OutputDataReceived += (s, x) => { if (x.Data != null) output.AppendLine(x.Data); };
+                proc.ErrorDataReceived += (s, x) => { if (x.Data != null) error.AppendLine(x.Data); };
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();   // 无参重载会等两个异步读取都收到 EOF 才返回
                 if (proc.ExitCode != 0)
                 {
-                    throw new IOException("tar 退出码 " + proc.ExitCode + "：" + (error.Trim().Split('\n')[0] ?? "无输出"));
+                    throw new IOException("tar 退出码 " + proc.ExitCode + "：" + (error.ToString().Trim().Split('\n')[0] ?? "无输出"));
                 }
-                return output;
+                return output.ToString();
             }
         }
 
@@ -252,12 +267,31 @@ namespace DshBackupAssistant
             {
                 throw new IOException("归档里缺少：" + string.Join("、", missing) + "。文件可能不完整，先别导入。");
             }
+            RejectExtra(manifest, entries);
             return manifest;
         }
 
-        /// <summary>解到目标目录（不含 manifest）。</summary>
-        public static void ExtractTo(string file, string targetDir)
+        /// <summary>
+        /// 完整性的第三道门：归档里不能有清单之外的顶层条目。多出来的条目会原样落到数据根下，
+        /// 等于让备份包往 DSH 数据目录里塞任意文件，所以直接拒收、不落盘。
+        /// </summary>
+        private static void RejectExtra(Manifest manifest, IEnumerable<string> entries)
         {
+            var allowed = new HashSet<string>(manifest.TargetPaths(), StringComparer.OrdinalIgnoreCase);
+            foreach (var name in entries)
+            {
+                var rel = (name.StartsWith("./", StringComparison.Ordinal) ? name.Substring(2) : name).TrimEnd('/');
+                if (rel.Length == 0 || rel == ManifestName) continue;
+                var top = rel.Split('/')[0];
+                if (allowed.Contains(top)) continue;
+                throw new IOException("归档里有备份清单之外的条目，已拒绝还原：" + name);
+            }
+        }
+
+        /// <summary>解到目标目录（不含 manifest）。解之前再核一遍条目白名单。</summary>
+        public static void ExtractTo(string file, string targetDir, Manifest manifest)
+        {
+            RejectExtra(manifest, Entries(file));
             Directory.CreateDirectory(targetDir);
             TarOut(ExtractArgs(file, "--exclude=./" + ManifestName, "-C", targetDir));
         }

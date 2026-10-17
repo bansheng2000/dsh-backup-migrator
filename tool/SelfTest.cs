@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 
 namespace DshBackupAssistant
 {
@@ -86,6 +87,82 @@ namespace DshBackupAssistant
                 Console.WriteLine("  info 将覆盖：" + (plan.Existing.Length == 0 ? "（无）" : string.Join("、", plan.Existing)));
             }
 
+            Console.WriteLine("[manifest 新字段]");
+            // manifest 是插件写的、助手读的，两边字段名必须一致。造两份：新的带字段，老的没有。
+            var current = Manifest.Parse("{\"plugin\":\"dsh-backup-migrator\",\"schema\":1,\"items\":[\"sessions\"],"
+                + "\"dsh\":\"1.7.2\",\"unpackedBytes\":123456789}");
+            Check("读到 dsh 版本", current.Dsh == "1.7.2", current.Dsh);
+            Check("读到 unpackedBytes", current.UnpackedBytes == 123456789, current.UnpackedBytes.ToString());
+            var legacy = Manifest.Parse("{\"plugin\":\"dsh-backup-migrator\",\"schema\":1}");
+            Check("老备份没有这两个字段也不炸（dsh 空串、unpackedBytes 0）",
+                legacy.Dsh == "" && legacy.UnpackedBytes == 0, legacy.Dsh + "/" + legacy.UnpackedBytes);
+            var broken = Manifest.Parse("{\"plugin\":\"dsh-backup-migrator\",\"dsh\":\"\",\"unpackedBytes\":\"不是数字\"}");
+            Check("unpackedBytes 类型不对当 0", broken.UnpackedBytes == 0, broken.UnpackedBytes.ToString());
+
+            Console.WriteLine("[还原前空间检查]");
+            Check("有 unpackedBytes 就按它算，再留 10% 余量",
+                Restore.RequiredBytes(1000, 999999) == 1100, Restore.RequiredBytes(1000, 999999).ToString());
+            Check("老备份按包大小 ×2.5 再留 10%",
+                Restore.RequiredBytes(0, 1000) == 2750, Restore.RequiredBytes(0, 1000).ToString());
+            var freeHere = Restore.FreeBytes(App.DataRoot);
+            Check("查得到目标盘可用空间（查不到会静默跳过检查，那样这条自检就假绿了）", freeHere >= 0, freeHere.ToString());
+            // 2^50 字节（1 PB）在任何机器上都装不下——用真实路径真跑一遍拒绝分支。
+            var absurd = new Restore.Plan
+            {
+                File = Path.Combine(Path.GetTempPath(), "no-such-backup.zip"),
+                Manifest = new Manifest { UnpackedBytes = 1L << 50 },
+                Bytes = 1024,
+            };
+            var refused = false;
+            string refusal = null;
+            try { Restore.EnsureSpace(absurd, App.DataRoot, "数据目录"); }
+            catch (Exception error) { refused = true; refusal = Log.Friendly(error); }
+            Check("unpackedBytes 荒谬大时被拒", refused, refusal);
+            Check("拒收文案给出需要/可用与清理建议",
+                refusal != null && refusal.Contains("需要约") && refusal.Contains("可用") && refusal.Contains("清理"), refusal);
+
+            Console.WriteLine("[卸载纯函数]");
+            var installedJson = "{\n  \"name\": \"p\",\n  \"version\": \"1.0.0\",\n  \"dsh\": { \"profile\": { \"bundles\": [\n"
+                + "    \"other-plugin\",\n    \"" + App.PluginId + "\"\n  ] } },\n  \"dependencies\": {\n"
+                + "    \"other-plugin\": \"1\",\n    \"" + App.PluginId + "\": \"file:/x/y\"\n  },\n"
+                + "  \"scripts\": { \"keep\": \"me\" }\n}\n";
+            Check("认出这份 package.json 装了本插件", PluginInstaller.InstallsPlugin(installedJson));
+            var stripped = PluginInstaller.StripPackageJson(installedJson);
+            Check("卸载后两处都不再提本插件", !PluginInstaller.InstallsPlugin(stripped), stripped);
+            using (var doc = JsonDocument.Parse(stripped))
+            {
+                var rootEl = doc.RootElement;
+                var bundles = rootEl.GetProperty("dsh").GetProperty("profile").GetProperty("bundles");
+                Check("bundles 里恰好只剩 other-plugin",
+                    bundles.GetArrayLength() == 1 && bundles[0].GetString() == "other-plugin", stripped);
+                var deps = rootEl.GetProperty("dependencies");
+                Check("dependencies 里只剩 other-plugin",
+                    deps.EnumerateObject().Count() == 1 && deps.TryGetProperty("other-plugin", out _), stripped);
+                Check("其它字段原样保留",
+                    rootEl.GetProperty("name").GetString() == "p"
+                    && rootEl.GetProperty("version").GetString() == "1.0.0"
+                    && rootEl.GetProperty("scripts").GetProperty("keep").GetString() == "me", stripped);
+            }
+            // 定位 profile 靠「谁登记过」而不是目录名：这里故意把装过的那个叫 desktop2。
+            var fakeProfiles = Path.Combine(Path.GetTempPath(), "dsh-assistant-profiles-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(Path.Combine(fakeProfiles, "clean"));
+                File.WriteAllText(Path.Combine(fakeProfiles, "clean", "package.json"),
+                    "{\"dsh\":{\"profile\":{\"bundles\":[\"other\"]}},\"dependencies\":{}}", new UTF8Encoding(false));
+                Directory.CreateDirectory(Path.Combine(fakeProfiles, "desktop2"));
+                File.WriteAllText(Path.Combine(fakeProfiles, "desktop2", "package.json"), installedJson, new UTF8Encoding(false));
+                var found = PluginInstaller.FindInstalledProfile(fakeProfiles);
+                Check("定位到装过本插件的 profile（不按目录名猜）",
+                    found != null && Path.GetFileName(found) == "desktop2", found);
+                Check("profiles 目录不存在时返回 null",
+                    PluginInstaller.FindInstalledProfile(Path.Combine(fakeProfiles, "nope")) == null);
+            }
+            finally
+            {
+                try { if (Directory.Exists(fakeProfiles)) Directory.Delete(fakeProfiles, true); } catch { }
+            }
+
             Console.WriteLine("[装插件（临时 profile）]");
             // 真跑一遍 Install：文件拷贝 + package.json 改写都过一遍，才算这块真的有底。
             // 用临时数据根，装完就删，绝不碰真实的 ~/.dsh。
@@ -120,12 +197,43 @@ namespace DshBackupAssistant
                 Check("bundles 里出现包名（不是短名 backup-migrator）",
                     patchedReal.Contains(quote + App.PluginId + quote) && !patchedReal.Contains(quote + "backup-migrator" + quote),
                     patchedReal);
-                // file: 指向 EXE 旁边的 plugin 目录（插件源码就解在那里），不是 profile 的 node_modules。
-                Check("dependencies 指向 EXE 旁的插件目录",
-                    patchedReal.Contains(quote + App.PluginId + quote + ": " + quote + "file:"), patchedReal);
-                Check("file: spec 是正斜杠且无尾分隔符",
-                    patchedReal.Contains(quote + "file:" + PluginInstaller.ToPosix(App.PayloadDir) + quote), patchedReal);
+                // file: 指向数据根下那个稳定目录（插件源码就解在那里），不是 profile 的 node_modules——
+                // EXE 会跟着备份目录搬家，指向 EXE 旁边的路径搬一次就失效。
+                Check("dependencies 指向数据根下的插件目录",
+                    patchedReal.Contains(quote + App.PluginId + quote + ": " + quote + "file:")
+                    && patchedReal.Contains(quote + "file:" + PluginInstaller.ToPosix(App.PayloadDir) + quote), patchedReal);
+                Check("file: spec 是正斜杠、无尾分隔符、落在数据根下",
+                    PluginInstaller.ToPosix(App.PayloadDir).StartsWith(PluginInstaller.ToPosix(App.DataRoot) + "/"),
+                    App.PayloadDir);
                 Check("原 package.json 留了备份", File.Exists(installed.Backup), installed.Backup);
+
+                // 落盘那一层也真跑一遍：备份 → 改写 → 删目录，三件事都在这里过一遍。
+                var removed = PluginInstaller.Uninstall();
+                Check("卸载后 package.json 里既没有 bundle 名也没有依赖",
+                    !PluginInstaller.InstallsPlugin(File.ReadAllText(Path.Combine(fakeProfile, "package.json"))));
+                Check("卸载后 node_modules 里的插件目录删掉了", !Directory.Exists(nodeModules), nodeModules);
+                Check("卸载前留了 package.json.bak-<时间戳>",
+                    File.Exists(removed.Backup) && Path.GetFileName(removed.Backup).StartsWith("package.json.bak-"), removed.Backup);
+
+                // 再卸一遍，这次 node_modules 里那条是 junction。删它绝不能顺穿链接删到目标里去——
+                // 本机踩过一次：对含 junction 的目录递归删，把别处 node_modules 里 9 个插件包一起删了。
+                var external = Path.Combine(fakeRoot, "external-plugin");
+                var linked = Path.Combine(fakeProfile, "node_modules", App.PluginId);
+                Directory.CreateDirectory(external);
+                File.WriteAllText(Path.Combine(external, "keep.txt"), "别处那份插件的内容", new UTF8Encoding(false));
+                File.WriteAllText(Path.Combine(fakeProfile, "package.json"), installedJson, new UTF8Encoding(false));
+                Directory.CreateDirectory(Path.GetDirectoryName(linked));
+                // .NET 没有建 junction 的公开 API（CreateSymbolicLink 要开发者模式/管理员），叫 cmd 干这事。
+                var mklink = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd",
+                    "/c mklink /J \"" + linked + "\" \"" + external + "\"")
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true });
+                mklink.WaitForExit();
+                Check("能造出 junction 来测",
+                    (new DirectoryInfo(linked).Attributes & FileAttributes.ReparsePoint) != 0, "cmd exit " + mklink.ExitCode);
+                PluginInstaller.Uninstall();
+                Check("删 junction 没有跟进去删目标（外面那份内容还在）",
+                    File.Exists(Path.Combine(external, "keep.txt")), external);
+                Check("junction 本身删掉了", !Directory.Exists(linked), linked);
             }
             catch (Exception error)
             {
