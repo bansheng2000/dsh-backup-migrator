@@ -531,8 +531,12 @@ step("写接口全走宿主连接层，上传走流式 fetch 路由", () => {
 
   // 裸 webServer 路由不在鉴权墙后面，隧道还会把公网请求伪造成回环来源——不能退回去。
   assert.ok(!index.includes("webServer.register("), "别再挂裸 webServer 路由");
-  assert.ok(index.includes("connection.rpc.handle("), "宿主侧没走连接层 RPC");
-  assert.ok(index.includes("connection.fetch.register({"), "宿主侧没有流式上传路由");
+  // rpc.handle 在本代 DSH 里对任何插件都注册失败（见 lib/index.js 头部注释），只当备用通道留着。
+  assert.ok(index.includes("connection.rpc.handle("), "备用通道 rpc.handle 不该删掉");
+  assert.ok(index.includes("connection.fetch.register({"), "宿主侧没有连接层 fetch 路由");
+  // 面板写接口：每个 endpoint 一条精确路由 + 显式 buffered（缺省会被连接层当流式通道）。
+  assert.ok(index.includes('path: API_PREFIX + "/" + name'), "面板端点必须逐条注册精确 fetch 路由");
+  assert.ok(index.includes('requestBody: "buffered"'), "面板 JSON 路由必须显式 buffered");
   assert.ok(index.includes('requestBody: "streaming"'), "上传必须 streaming：几百 MB 进不了 JSON 信封");
   // streaming 路由不把请求体读干净，连接层会 req.destroy() 把响应截断。
   assert.ok(index.includes("Readable.fromWeb("), "上传体要有流式落盘通道");
@@ -545,23 +549,30 @@ step("写接口全走宿主连接层，上传走流式 fetch 路由", () => {
   assert.ok(chan !== null && chanClient !== null, "两边都要有 CHANNEL");
   assert.equal(chanClient[1], chan[1], "客户端与宿主的通道名必须一致");
 
-  const imp = /const IMPORT_PATH = "([^"]+)"/.exec(index);
+  const prefix = /const API_PREFIX = "([^"]+)"/.exec(index);
+  const prefixClient = /const API_PREFIX = "([^"]+)"/.exec(client);
+  const imp = /const IMPORT_PATH = API_PREFIX \+ "([^"]+)"/.exec(index);
   const up = /const ENDPOINT_UPLOAD = "([^"]+)"/.exec(client);
-  assert.ok(imp !== null && up !== null, "两边都要有上传路径");
-  assert.equal("/" + up[1], imp[1], "上传路径必须与宿主 IMPORT_PATH 同源");
+  assert.ok(prefix !== null && prefixClient !== null && imp !== null && up !== null,
+    "两边都要有 API_PREFIX / IMPORT_PATH / ENDPOINT_UPLOAD");
+  // 客户端用相对 URL（靠 document.baseURI 解析），所以只比去掉前导斜杠的那半截。
+  assert.equal(prefixClient[1], prefix[1].replace(/^\//, ""), "客户端与宿主的 API_PREFIX 必须同源");
+  assert.equal("/" + up[1], prefix[1] + imp[1], "上传路径必须与宿主 IMPORT_PATH 同源");
 
-  // 连接层注册 channel 时会在**读取者自己的 ctx** 上取 owner.webServer（index.js:855-872），
-  // 所以 webServer 必须进我们的 inject 名单；否则整个 effect 体（含 fetch 路由与定时器）一起黄，
-  // 表现是「面板能渲染、宿主零路由、客户端报 transport failure … HTTP 405」。
+  // 注：rpc.handle 的 webServer 守卫看的是**连接层插件那条 fiber**，不是我们的 inject 名单
+  // （实测调用方 inject 空/满都抛），所以 inject 里有没有 webServer 都不影响它失败。
+  // 这里保留 webServer 只是因为面板的 /api 前缀路由也依赖它——服务齐了再注册更省心。
   assert.ok(index.includes('ctx.inject(["settings", "webServer", "connection"]'),
-    "inject 名单必须含 webServer（连接层注册要用我们的 ctx 取它）");
+    "inject 名单保持 settings/webServer/connection");
   // 启动诊断：宿主半插件挂没挂只能靠 trace 落盘（<数据根>/.backup-migrator-plugin/boot.log）。
   for (const token of ['trace("模块已加载 v" + VERSION)', "trace(\"inject 回调进入", "inject 回调 20 秒仍未进入",
+    'trace("面板 fetch 路由注册 "', 'trace("fetch 路由注册失败 " + name + "：" + messageOf(error))',
     'trace("rpc.handle 注册成功：" + CHANNEL)', 'trace("fetch.register 注册成功：" + IMPORT_PATH)',
     'trace("rpc.handle 注册失败：" + messageOf(error))', 'trace("fetch.register 注册失败：" + messageOf(error))']) {
     assert.ok(index.includes(token), "缺启动诊断：" + token);
   }
-  // 一处注册失败不能拖垮另一处（rpc 挂了上传路由还得在），disposer 清理也不能再抛。
+  // 一处注册失败不能拖垮另一处（rpc 挂了路由还得在），disposer 清理也不能再抛。
+  assert.ok(index.includes("for (const dispose of onJson) { try { dispose?.(); } catch"), "面板路由 disposer 要逐条兜住");
   assert.ok(index.includes("try { onRpc?.(); } catch"), "disposer 清理要各自兜住");
   assert.ok(index.includes("clearTimeout(pendingTimer)"), "inject 回调进入后要停掉等待探针");
 
@@ -582,6 +593,13 @@ step("面板声明了连接层客户端包（否则 connection 服务不会加�
   const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
   assert.ok(client.includes('const inject = ["slots", "connection"]'), "客户端没注入 connection");
   assert.ok(!client.includes("BASE = "), "旧的自建路由前缀没删干净");
+  // 面板首选精确 fetch 路由，只有老宿主（没有这条路由）才回退 RPC。
+  assert.ok(client.includes("async function viaFetch(endpoint, payload)"), "面板没有 fetch 路由通道");
+  assert.ok(client.includes('headers: { "content-type": "application/json", "x-backup-migrator": "1" }'),
+    "面板 fetch 要带 content-type 与自定义头");
+  assert.ok(client.includes("res.status === 404 || res.status === 405 || res.status === 501"),
+    "只该在路由缺失（404/405/501）时回退 RPC，鉴权被拒不能回退");
+  assert.ok(client.includes("await connection.rpc.call(CHANNEL, endpoint, payload)"), "回退路径没了");
 });
 
 step("新增的可选项都不在默认集里（默认打包行为不变）", () => {

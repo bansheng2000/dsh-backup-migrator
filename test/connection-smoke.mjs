@@ -6,6 +6,10 @@
  * 信封形状（{ok,value} / {ok:false,error:{code,message,details}}）、流式上传的收尾、
  * 撞名加序号、失败时不留 .part 残渣。
  *
+ * 0.3.3 起面板的写接口是**每个 endpoint 一条精确 fetch 路由**（/api/dsh-backup-migrator/<endpoint>）：
+ * 本代 DSH 里 connection.rpc.handle 对任何插件都注册失败（见 lib/index.js 头部注释），面板只能走
+ * 连接层自己挂的 /api 前缀。这里就按那个契约逐条验：路径、方法、requestBody 模式。
+ *
  * 跑法（PATH 必须先找到系统 bsdtar，否则 GNU tar 不认 --format zip）：
  *   PATH="/c/Windows/system32:$PATH" node test/connection-smoke.mjs
  * 传参可以指到装机副本上验「装进去的那份」：
@@ -58,7 +62,8 @@ const settings = {
   },
 };
 let rpcHandler = null;
-let fetchRoute = null;
+/** 精确 fetch 路由登记表：pathname → route（与连接层 fetchRoutes 的键法一致）。 */
+const routes = new Map();
 const ctx = {
   logger: { info() {}, debug() {}, error() {}, warn(...a) { console.log("[warn]", ...a); } },
   effect(fn) { const d = fn(); return typeof d === "function" ? d : () => {}; },
@@ -67,47 +72,97 @@ const ctx = {
   on() {},
   settings,
   connection: {
+    // rpc.handle 在本代 DSH 里必抛（连接层拿自己的 ctx 找 webServer），但我们仍保留注册。
     rpc: { handle(channel, handler) { assert.equal(channel, "/dsh-backup-migrator"); rpcHandler = handler; return () => { rpcHandler = null; }; } },
-    fetch: { register(route) { fetchRoute = route; return () => { fetchRoute = null; }; } },
+    fetch: {
+      register(route) {
+        assert.ok(!routes.has(route.path), "路径重复注册：" + route.path);
+        routes.set(route.path, route);
+        return () => { routes.delete(route.path); };
+      },
+    },
   },
 };
 mod.apply(ctx, mod.Config({}));
-assert.ok(rpcHandler !== null, "rpc handler 没注册");
-assert.ok(fetchRoute !== null, "fetch route 没注册");
-assert.equal(fetchRoute.path, "/api/dsh-backup-migrator/import");
+assert.ok(rpcHandler !== null, "备用通道 rpc.handle 也要注册（将来 DSH 修好即恢复）");
+
+const PANEL = ["status", "backup", "options", "inspect", "restore", "delete", "export", "hello",
+  "notify-targets", "cloud/list", "cloud/upload", "cloud/download", "uninstall"];
+for (const ep of PANEL) {
+  const route = routes.get("/api/dsh-backup-migrator/" + ep);
+  assert.ok(route !== undefined, "缺面板精确路由：" + ep + "（现有 " + [...routes.keys()].join(", ") + "）");
+  assert.deepEqual([...route.methods], ["POST"], ep + " 只该收 POST");
+  // 缺省 requestBody 会被连接层判成流式通道（request.json() 在那种形态下不可靠），必须显式 buffered。
+  assert.equal(route.requestBody, "buffered", ep + " 必须 buffered");
+}
+const fetchRoute = routes.get("/api/dsh-backup-migrator/import");
+assert.ok(fetchRoute !== undefined, "上传路由没注册");
 assert.deepEqual([...fetchRoute.methods], ["POST"]);
 assert.equal(fetchRoute.requestBody, "streaming");
-console.log("ok   rpc.handle / fetch.register 都挂上了，上传路由 " + fetchRoute.path + " streaming");
+assert.equal(routes.size, PANEL.length + 1, "路由条数不对：" + routes.size);
+console.log("ok   " + PANEL.length + " 条面板精确 fetch 路由（buffered）+ 上传路由 " + fetchRoute.path + "（streaming）");
 
-const nope = await rpcHandler("nope", {});
-assert.equal(nope.ok, false);
-assert.deepEqual(nope.error.details, {});
-assert.equal(nope.error.code, "backup-migrator/not-found");
-console.log("ok   未知 endpoint → ok:false + code/details");
+/** 像面板那样打一条 JSON 路由（默认带 x-backup-migrator 头），返回 {status, json}。 */
+async function callRaw(endpoint, payload, headers) {
+  const route = routes.get("/api/dsh-backup-migrator/" + endpoint);
+  assert.ok(route !== undefined, "没有这条路由：" + endpoint);
+  const res = await route.fetch(new Request("http://127.0.0.1:1/api/dsh-backup-migrator/" + endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-backup-migrator": "1", ...(headers ?? {}) },
+    body: JSON.stringify(payload ?? {}),
+  }));
+  const json = await res.json().catch(() => null);
+  return { status: res.status, json };
+}
+/** 面板 api() 的等价物：只认 200 + {ok:true,value}。 */
+async function call(endpoint, payload) {
+  const r = await callRaw(endpoint, payload);
+  assert.equal(r.status, 200, endpoint + " → HTTP " + r.status + " " + JSON.stringify(r.json));
+  return r.json;
+}
 
-const hello = await rpcHandler("hello", { version: "0.2.1-rc.2" });
+const nohead = await callRaw("status", {}, { "x-backup-migrator": "" });
+assert.equal(nohead.status, 403);
+assert.equal(nohead.json.ok, false);
+assert.equal(nohead.json.error.code, "backup-migrator/forbidden");
+console.log("ok   缺 x-backup-migrator 头 → 403 " + nohead.json.error.message);
+
+// 无 body 无 content-type：面板有端点就是空 POST（status / notify-targets）。
+const bareRes = await routes.get("/api/dsh-backup-migrator/status").fetch(
+  new Request("http://127.0.0.1:1/api/dsh-backup-migrator/status", { method: "POST", headers: { "x-backup-migrator": "1" } }));
+assert.equal(bareRes.status, 200);
+assert.equal((await bareRes.json()).ok, true);
+console.log("ok   空请求体当 {} 处理（不带参数的端点照样 200）");
+
+// 精确路由表里没有的就是没有：未知 endpoint 连路由都没有（连接层给 404），
+// 面板那边表现为「拿不到接口」，不会伪装成成功。
+assert.equal(routes.get("/api/dsh-backup-migrator/nope"), undefined, "未知 endpoint 不该有路由");
+console.log("ok   未知 endpoint 没有路由（连接层 404），不是假成功");
+
+const hello = await call("hello", { version: "0.2.1-rc.2" });
 assert.deepEqual(hello, { ok: true, value: { dsh: "0.2.1-rc.2" } });
 console.log("ok   hello 记住 DSH 版本 → " + hello.value.dsh);
 
-const nt = await rpcHandler("notify-targets", {});
+const nt = await call("notify-targets", {});
 assert.equal(nt.ok, true);
 assert.deepEqual(nt.value, { available: false, targets: [] });
 console.log("ok   没装 dsh-im 时 notify-targets 如实报不可用");
 
-const restore = await rpcHandler("restore", {});
+const restore = await call("restore", {});
 assert.equal(restore.ok, false);
 assert.ok(restore.error.message.includes("选一份备份"), restore.error.message);
 assert.deepEqual(restore.error.details, {});
+assert.deepEqual(restore.error.details, {});
 console.log("ok   处理器抛错被 run() 兜住 → ok:false（不是 500 纯文本）");
 
-const opt = await rpcHandler("options", { patch: { keepCount: 3 } });
+const opt = await call("options", { patch: { keepCount: 3 } });
 assert.equal(opt.ok, true);
 assert.equal(opt.value.options.keepCount, 3);
 assert.equal(state.options.keepCount, 3, "要真写进 settings");
 assert.equal(opt.value.selectionPending, true, "冷缓存先报 pending（snapshot 的字段名是 selectionPending）");
 console.log("ok   options 写盘 + 回全量快照（乐观更新用）");
 
-const st = await rpcHandler("status", {});
+const st = await call("status", {});
 assert.equal(st.ok, true);
 const ids = st.value.catalog.map((i) => i.id);
 for (const id of ["channel-pack", "openai-gateway", "remote-web-ui-registry", "remote-web-ui-devices", "worktrees"]) {
@@ -195,12 +250,12 @@ fs.rmSync(tmpData, { recursive: true, force: true });
 // ── 走一次真备份：settings → startBackup → createBackup → 进度/状态 → prune ──
 state.options = { ...state.options, items: ["memories"], format: "zip", keepCount: 10 };
 const before = new Set(fs.readdirSync(tmpStore));
-const started = await rpcHandler("backup", { label: "harness" });
+const started = await call("backup", { label: "harness" });
 assert.equal(started.ok, true, JSON.stringify(started));
 let st2 = null;
 const phases = new Set();
 for (let i = 0; i < 240; i += 1) {
-  st2 = await rpcHandler("status", {});
+  st2 = await call("status", {});
   assert.equal(st2.ok, true);
   if (st2.value.progress?.phase !== undefined) phases.add(st2.value.progress.phase);
   if (st2.value.running !== true) break;
