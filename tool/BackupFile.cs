@@ -101,6 +101,11 @@ namespace DshBackupAssistant
             { "guardian", "guardian" },
             { "im", "im" },
             { "market", "dsh-market" },
+            { "channel-pack", "channel-pack" },
+            { "openai-gateway", "openai-gateway" },
+            { "remote-web-ui-registry", "remote-web-ui-registry" },
+            { "remote-web-ui-devices", "remote-web-ui-devices.json" },
+            { "worktrees", "worktrees" },
             { "credentials", ".credentials.yaml" },
         };
 
@@ -115,6 +120,11 @@ namespace DshBackupAssistant
             { "guardian", "启动自愈记录" },
             { "im", "IM 渠道配置" },
             { "market", "插件市场数据（含登录态）" },
+            { "channel-pack", "渠道包数据（含 API Key）" },
+            { "openai-gateway", "OpenAI 网关配置" },
+            { "remote-web-ui-registry", "远程访问登记表" },
+            { "remote-web-ui-devices", "远程访问设备表（敏感）" },
+            { "worktrees", "插件工作树记录" },
             { "credentials", "凭据 .credentials.yaml（敏感）" },
         };
 

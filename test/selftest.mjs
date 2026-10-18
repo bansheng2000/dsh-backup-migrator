@@ -524,6 +524,73 @@ step("面板接上了新功能的入口", () => {
   }
 });
 
+// ---- 14. 写接口走宿主连接层（浏览器鉴权 + Host 信任由宿主把关） ----------------
+step("写接口全走宿主连接层，上传走流式 fetch 路由", () => {
+  const index = readFileSync(new URL("../lib/index.js", import.meta.url), "utf8");
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+
+  // 裸 webServer 路由不在鉴权墙后面，隧道还会把公网请求伪造成回环来源——不能退回去。
+  assert.ok(!index.includes("webServer.register("), "别再挂裸 webServer 路由");
+  assert.ok(index.includes("connection.rpc.handle("), "宿主侧没走连接层 RPC");
+  assert.ok(index.includes("connection.fetch.register({"), "宿主侧没有流式上传路由");
+  assert.ok(index.includes('requestBody: "streaming"'), "上传必须 streaming：几百 MB 进不了 JSON 信封");
+  // streaming 路由不把请求体读干净，连接层会 req.destroy() 把响应截断。
+  assert.ok(index.includes("Readable.fromWeb("), "上传体要有流式落盘通道");
+  // 上传落盘也不能把已有备份覆盖掉：同一秒连传两次要自动加序号（createBackup/export 同款）。
+  assert.ok(index.includes("existsSync(join(storeDir, name))"), "上传落盘要防撞名覆盖");
+  assert.ok(index.includes('name = stem + "-" + n + ext'), "撞名要加 -2/-3 序号");
+
+  const chan = /const CHANNEL = "([^"]+)"/.exec(index);
+  const chanClient = /const CHANNEL = "([^"]+)"/.exec(client);
+  assert.ok(chan !== null && chanClient !== null, "两边都要有 CHANNEL");
+  assert.equal(chanClient[1], chan[1], "客户端与宿主的通道名必须一致");
+
+  const imp = /const IMPORT_PATH = "([^"]+)"/.exec(index);
+  const up = /const ENDPOINT_UPLOAD = "([^"]+)"/.exec(client);
+  assert.ok(imp !== null && up !== null, "两边都要有上传路径");
+  assert.equal("/" + up[1], imp[1], "上传路径必须与宿主 IMPORT_PATH 同源");
+
+  // 连接层客户端的 parseConnectionResponse 要求 error.details 是对象，缺了整个请求会变成
+  // 「connection: invalid server-response failure」，用户看不到真正的错因。
+  assert.ok(index.includes("details: {}"), "bad() 必须带 details 对象");
+  for (const ep of ["status", "options", "backup", "inspect", "restore", "delete", "export",
+    "hello", "notify-targets", "cloud/list", "cloud/upload", "cloud/download", "uninstall"]) {
+    // 键可能带引号（"cloud/list":）也可能不带（status:），两种写法都认。
+    assert.ok(index.includes('"' + ep + '":') || index.includes(ep + ":"), "缺 endpoint：" + ep);
+  }
+});
+
+step("面板声明了连接层客户端包（否则 connection 服务不会加载，面板整块挂不上）", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.ok(pkg.dsh.client.inject.includes("@deepseek-ai/dsh-client-connection"),
+    "dsh.client.inject 少了 @deepseek-ai/dsh-client-connection");
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(client.includes('const inject = ["slots", "connection"]'), "客户端没注入 connection");
+  assert.ok(!client.includes("BASE = "), "旧的自建路由前缀没删干净");
+});
+
+step("新增的可选项都不在默认集里（默认打包行为不变）", () => {
+  const backup = readFileSync(new URL("../lib/backup.js", import.meta.url), "utf8");
+  const def = /const DEFAULT_ITEMS = \[([^\]]+)\]/.exec(backup);
+  assert.ok(def !== null, "没找到 DEFAULT_ITEMS");
+  for (const id of ["market", "channel-pack", "openai-gateway", "remote-web-ui-registry",
+    "remote-web-ui-devices", "worktrees"]) {
+    assert.ok(backup.includes('id: "' + id + '"'), "ITEMS 里没有 " + id);
+    assert.ok(!def[1].includes('"' + id + '"'), id + " 不该在默认集里");
+  }
+});
+
+step("版本号三处同步（package.json / csproj / README）", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const v = String(pkg.version).replace(/\./g, "\\.");
+  assert.ok(new RegExp("<Version>" + v + "</Version>").test(
+    readFileSync(new URL("../tool/DshBackupAssistant.csproj", import.meta.url), "utf8")),
+    "csproj 版本没跟上 package.json：" + pkg.version);
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.ok(readme.includes("/refs/tags/v" + pkg.version), "README 的安装 spec 版本没跟上");
+  assert.ok(readme.includes("DSH-Backup-Assistant-" + pkg.version + "-win-x64.exe"), "README 的 EXE 地址没跟上");
+});
+
 console.log("dsh-backup-migrator selftest");
 console.log(steps.join("\n"));
 rmSync(tmp, { recursive: true, force: true });

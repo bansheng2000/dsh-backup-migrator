@@ -4,7 +4,8 @@
 
 ## 它做什么
 
-- **备份内容在设置页里勾** —— 聊天记录 / 附件 / 长期记忆 / 存储与状态 / 集成配置 / 插件与 profile / 启动自愈 / IM 渠道 / 插件市场数据（含登录态，默认不带）/ 凭据（默认不带）。
+- **备份内容在设置页里勾** —— 聊天记录 / 附件 / 长期记忆 / 存储与状态 / 集成配置 / 插件与 profile / 启动自愈 / IM 渠道。
+  另有几项**只在你勾了才进包**（都是插件自己写出来的状态，默认不带）：插件市场数据（含登录态）、渠道包数据（含 API Key）、OpenAI 网关配置、远程访问登记表、远程访问设备表、插件工作树记录、凭据 `.credentials.yaml`。
 - **单文件导出** —— 一份 `.zip`（默认）或 `.tar.gz`，拷到 U 盘 / 网盘 / 别的盘符都行。
 - **自动定时备份** —— 间隔自己设（分钟，低于 10 按 10 算；0 = 关），超量自动删旧的。
 - **换机导入** —— 导入前先校验（manifest、条目路径安全、勾选项齐全、sha256），通过后两种方式还原：
@@ -18,6 +19,7 @@
 | `profiles/*/node_modules` | 本机 1248MB 里 1248.16MB 是它；换机后一条 `pnpm install` 就有 |
 | `dsh-runtimes` | 自带的 node/python/pnpm，装 DSH 时会重新下载 |
 | `cache` / `telemetry` | 可再生 / 无价值 |
+| `origin-plugin-venv` `opencode-bridge` `.cloudflared-live` | 都是几百 MB 的可再生运行时，换机后由对应插件自己重建（面板里也写明了） |
 
 实测：勾上「插件与 profile + 聊天记录 + 长期记忆 + 存储与状态 + 集成配置 + 附件」打出来的包约 **24MB**，不带勾选的话更小。
 
@@ -58,7 +60,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.1"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.2"
 ```
 
 ## 用法
@@ -88,20 +90,20 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 
 ```powershell
 & "DSH备份助手.exe"                # 打开窗口（默认，就用这个）
-& "DSH备份助手.exe" --selftest     # 自检，59 项，用来确认这份 EXE 本身没坏
+& "DSH备份助手.exe" --selftest     # 自检，76 项，用来确认这份 EXE 本身没坏
 & "DSH备份助手.exe" --restore 备份.zip   # 无界面直写数据目录（给脚本用）
 & "DSH备份助手.exe" --stage   备份.zip   # 无界面解到暂存区 + restore.ps1
 ```
 
 窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
 
-下载（v0.3.1，win-x64，49MB）：
+下载（v0.3.2，win-x64，49MB）：
 
 ```
-https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.1/DSH-Backup-Assistant-0.3.1-win-x64.exe
+https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.2/DSH-Backup-Assistant-0.3.2-win-x64.exe
 ```
 
-（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.1-win-x64.exe`，双击一样能跑。）
+（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.2-win-x64.exe`，双击一样能跑。）
 
 ### 目录结构
 
@@ -151,6 +153,8 @@ node test/selftest.mjs
 - manifest（`dsh-backup-manifest.json`）和数据写在**同一次 `-cf`** 里 —— bsdtar 不能追加进 zip，实测 `-rf` 必失败。
 - 还原前扫全部条目，拒绝 `/` 开头、`../`、`..\`、`C:` 这类越界路径。
 - 文件名只认 `dsh-backup-*.zip|.tar.gz`，且操作前一律 `basename()` + 拼回 storeDir，防路径穿越。
+- **写接口走宿主连接层，不挂裸 `webServer` 路由**：裸路由**不在宿主的浏览器鉴权墙后面**，而且经 cloudflared 之类的隧道打进来时 `req.socket.remoteAddress` 恒为回环、连 Host 判据都不好使（实测公网无凭据就能读写别的插件的裸路由）。所以面板的每个动作都走 `ctx.connection.rpc.handle(CHANNEL, handler)` + 渲染进程 `connection.rpc.call()`，浏览器凭据与 Host/Origin 信任由宿主把关；响应信封由连接层拼（失败对象必须带 `error.details`，否则客户端解析直接报 `invalid server-response failure`）。
+- 上传备份（几百 MB）**不能**走 RPC 的 JSON 信封，单独注册一条流式 fetch 路由 `/api/dsh-backup-migrator/import`（`requestBody: "streaming"`，无大小上限）。注意流式路由必须把请求体读干净，否则连接层会 `req.destroy()` 把响应截断。
 
 ## 已知限制
 
