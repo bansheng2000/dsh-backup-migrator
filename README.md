@@ -170,3 +170,27 @@ export PATH="/c/Windows/system32:$PATH"
 - 云端备份只做了 WebDAV；下载撞名会加 `-2/-3` 序号，不覆盖本地唯一那份。
 - 卸载只摘掉插件的挂载与包目录，不删备份、不删聊天记录。
 - 文件夹用宿主自带的原生对话框点选（桌面端 preload `__DSH_DIRECTORY_PICKER__.pick()`，Web GUI 走 `uiWorkspace.pickDirectory()`）；远程连过来、宿主也拿不到对话框时，按钮会提示改用文本框手填。
+
+## 排障：面板报 transport failure（HTTP 405）或所有接口都不通
+
+面板能渲染、但每个操作都报 `transport failure for /dsh-backup-migrator/…: HTTP 405`，
+说明**宿主侧半插件没注册出路由**（405 是宿主静态前端路由兜住的，不是我们返回的）。
+
+插件每次启动都会往下面这个文件写启动诊断（写入失败也绝不影响加载）：
+
+- Windows：`%USERPROFILE%\.dsh\.backup-migrator-plugin\boot.log`
+- macOS / Linux：`~/.dsh/.backup-migrator-plugin/boot.log`
+
+对照读法：
+
+| 日志里最后一行 | 含义 |
+| --- | --- |
+| 什么都没有 | 宿主根本没加载到 `lib/index.js`（包没装全 / 条目没挂上） |
+| `模块已加载 v…` | 模块加载成功 |
+| 有 `apply 进入…`、没有 `inject 回调进入…` | 有服务一直不可用（大概率是宿主版本把某个服务换掉了） |
+| `警告：inject 回调 20 秒仍未进入…` | 同上，且已确认不是「慢」而是「等不到」 |
+| `inject 回调进入：settings=… webServer=… connection=…` | 服务齐了；接下去看注册结果 |
+| `rpc.handle 注册失败：…` / `fetch.register 注册失败：…` | 连接层拒绝注册，后面跟的就是真错因 |
+
+`connection` 缺失说明这个 DSH 版本没有（或没有对我们开放）宿主连接层——面板的写接口无法工作，
+需要把本插件的写接口退回 `webServer.register`（代价：那些路由不在宿主浏览器鉴权墙后面）。

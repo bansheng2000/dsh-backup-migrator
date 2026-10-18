@@ -550,6 +550,21 @@ step("写接口全走宿主连接层，上传走流式 fetch 路由", () => {
   assert.ok(imp !== null && up !== null, "两边都要有上传路径");
   assert.equal("/" + up[1], imp[1], "上传路径必须与宿主 IMPORT_PATH 同源");
 
+  // 连接层注册 channel 时会在**读取者自己的 ctx** 上取 owner.webServer（index.js:855-872），
+  // 所以 webServer 必须进我们的 inject 名单；否则整个 effect 体（含 fetch 路由与定时器）一起黄，
+  // 表现是「面板能渲染、宿主零路由、客户端报 transport failure … HTTP 405」。
+  assert.ok(index.includes('ctx.inject(["settings", "webServer", "connection"]'),
+    "inject 名单必须含 webServer（连接层注册要用我们的 ctx 取它）");
+  // 启动诊断：宿主半插件挂没挂只能靠 trace 落盘（<数据根>/.backup-migrator-plugin/boot.log）。
+  for (const token of ['trace("模块已加载 v" + VERSION)', "trace(\"inject 回调进入", "inject 回调 20 秒仍未进入",
+    'trace("rpc.handle 注册成功：" + CHANNEL)', 'trace("fetch.register 注册成功：" + IMPORT_PATH)',
+    'trace("rpc.handle 注册失败：" + messageOf(error))', 'trace("fetch.register 注册失败：" + messageOf(error))']) {
+    assert.ok(index.includes(token), "缺启动诊断：" + token);
+  }
+  // 一处注册失败不能拖垮另一处（rpc 挂了上传路由还得在），disposer 清理也不能再抛。
+  assert.ok(index.includes("try { onRpc?.(); } catch"), "disposer 清理要各自兜住");
+  assert.ok(index.includes("clearTimeout(pendingTimer)"), "inject 回调进入后要停掉等待探针");
+
   // 连接层客户端的 parseConnectionResponse 要求 error.details 是对象，缺了整个请求会变成
   // 「connection: invalid server-response failure」，用户看不到真正的错因。
   assert.ok(index.includes("details: {}"), "bad() 必须带 details 对象");
