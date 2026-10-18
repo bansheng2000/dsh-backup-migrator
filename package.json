@@ -1,6 +1,6 @@
 {
   "name": "dsh-backup-migrator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH 配置与数据备份、一键换机：可选题、定时、自定义存储路径，导出单一备份文件并支持校验后导入。",
   "type": "module",
   "main": "lib/index.js",

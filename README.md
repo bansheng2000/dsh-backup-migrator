@@ -45,7 +45,8 @@
 然后在该目录里装依赖（用 DSH 自带的 pnpm）：
 
 ```powershell
-node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$env:USERPROFILE\.dsh\profiles\desktop" install --config.minimumReleaseAge=0 --config.strictStorePkgContentCheck=false
+# DSH 0.2.1 起 pnpm 挪进了 primary-runtime（旧版在 resources\runtime\pnpm\bin\pnpm.mjs）
+node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.cjs" --dir "$env:USERPROFILE\.dsh\profiles\desktop" install --config.minimumReleaseAge=0 --config.strictStorePkgContentCheck=false
 ```
 
 重启 DSH，设置页出现「备份与换机」。
@@ -57,7 +58,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.0"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.1"
 ```
 
 ## 用法
@@ -76,6 +77,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 - **manifest 记下 DSH 版本**：插件自报（面板读 `__DSH_BOOT__`）优先，其次环境变量，再其次读 app.asar 的 package.json；导入时面板会显示这是哪个 DSH 版本打的包。
 - **备份失败通知**：接了宿主 dsh-im 时，失败会往你选的机器人/会话发一条（动作、时间、原因）；没装 dsh-im 就在面板里说明原因，不假装发过。
 - **云端备份（WebDAV）**：填地址、远端目录、账号、口令即可上传/列目录/下载（坚果云、Nextcloud 这类都行），零第三方依赖。口令是**明文存在本机配置**里的，建议用应用专用密码。
+- **设置页点一下就有反应**：勾备份内容、切开关都是**乐观更新** —— 界面立刻变，写盘在后台按顺序排队；只有写失败才回到磁盘真值并提示。文件体积在后台统计，面板先显示上次的数字、旁边标「正在统计…」，不再卡住点击。
 - **卸载本插件**：从 profile 的 package.json 里摘掉并删包目录，改前先存一份 `package.json.bak-<时间戳>`。**聊天记录、备份文件、配置都不删**，重启 DSH 后插件才真正消失。
 
 ## 备份助手 EXE（换机不用先装插件）
@@ -86,20 +88,20 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\pnpm\bin\pnpm.mjs" --dir "$
 
 ```powershell
 & "DSH备份助手.exe"                # 打开窗口（默认，就用这个）
-& "DSH备份助手.exe" --selftest     # 自检，40+ 项，用来确认这份 EXE 本身没坏
+& "DSH备份助手.exe" --selftest     # 自检，59 项，用来确认这份 EXE 本身没坏
 & "DSH备份助手.exe" --restore 备份.zip   # 无界面直写数据目录（给脚本用）
 & "DSH备份助手.exe" --stage   备份.zip   # 无界面解到暂存区 + restore.ps1
 ```
 
 窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
 
-下载（v0.3.0，win-x64，49MB）：
+下载（v0.3.1，win-x64，49MB）：
 
 ```
-https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.0/DSH-Backup-Assistant-0.3.0-win-x64.exe
+https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.1/DSH-Backup-Assistant-0.3.1-win-x64.exe
 ```
 
-（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.0-win-x64.exe`，双击一样能跑。）
+（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.1-win-x64.exe`，双击一样能跑。）
 
 ### 目录结构
 

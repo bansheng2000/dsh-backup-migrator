@@ -44,8 +44,8 @@ put(join(source, ".credentials.yaml"), "token: secret");
 
 process.env.DSH_DATA_DIR = source;
 
-const { createBackup, deleteBackup, exportBackup, inspectBackup, itemsOf, listBackupFiles, listBackups,
-  prune, readManifest, restoreBackup, dataRootOf, storeDirOf, defaultOptions, scan,
+const { createBackup, deleteBackup, exportBackup, inspectBackup, invalidateScan, itemsOf, listBackupFiles,
+  listBackups, prune, readManifest, restoreBackup, dataRootOf, storeDirOf, defaultOptions, scan, scanLazy,
   checkSpace, dshVersionOf, freeBytesOf, needBytesOf, rememberDshVersion } =
   await import("../lib/backup.js");
 const { cloudDownload, cloudList, cloudUpload, cloudOf, parsePropfind, remoteUrl, authHeaders, CLOUD_BACKUP_NAME } =
@@ -450,6 +450,70 @@ step("卸载：package.json 改写是纯函数，落盘后包目录真被删掉"
   assert.ok(!readFileSync(join(profile, "package.json"), "utf8").includes("dsh-backup-migrator"));
   assert.deepEqual(findProfiles(root), [], "卸完就该认不出来了");
   assert.deepEqual(findProfiles(join(tmp, "nope")), [], "没有 profiles 目录时给空数组，不抛错");
+});
+
+// ---- 13. 设置页响应：扫盘不许挡在请求路径上 -----------------------------------
+await stepAsync("scanLazy 不阻塞：冷缓存先给 pending，后台算完再给准数", async () => {
+  invalidateScan();
+  const t0 = Date.now();
+  const first = scanLazy(["sessions", "profiles"], source);
+  const cost = Date.now() - t0;
+  // 这条断言才是回归护栏：1.7 秒的全量扫盘一旦被挪回请求路径，这里就不再是 pending。
+  assert.equal(first.pending, true, "冷缓存第一次必须报 pending（数字还会变）");
+  assert.ok(cost < 50, "冷缓存也不该阻塞请求：" + cost + "ms");
+
+  const deadline = Date.now() + 5000;
+  let settled = scanLazy(["sessions", "profiles"], source);
+  while (settled.pending === true && Date.now() < deadline) {
+    await new Promise((done) => setTimeout(done, 20));
+    settled = scanLazy(["sessions", "profiles"], source);
+  }
+  assert.equal(settled.pending, false, "后台补算应在 5 秒内完成");
+  assert.deepEqual(settled.value, scan(["sessions", "profiles"], source), "后台算出来的数字要和同步扫的一致");
+});
+
+await stepAsync("换组合不重扫：量过的单元直接复用，未量到的先不计", async () => {
+  invalidateScan();
+  const only = scan(["sessions"], source);
+  const mixed = scanLazy(["sessions", "memories"], source);
+  assert.equal(mixed.pending, true, "memories 还没量过 → 数字还会变");
+  assert.equal(mixed.value.files, only.files, "已量过的 sessions 应立刻体现在部分结果里");
+  assert.equal(mixed.value.bytes, only.bytes);
+
+  const deadline = Date.now() + 5000;
+  let settled = scanLazy(["sessions", "memories"], source);
+  while (settled.pending === true && Date.now() < deadline) {
+    await new Promise((done) => setTimeout(done, 20));
+    settled = scanLazy(["sessions", "memories"], source);
+  }
+  const both = scan(["sessions", "memories"], source);
+  assert.deepEqual(settled.value, both, "补完之后要和同步扫的一致");
+  assert.ok(both.bytes >= only.bytes && both.files >= only.files);
+});
+
+step("面板：写配置不再等两趟往返（乐观更新 + 不回扫）", () => {
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  // 点击这条路必须同步回显、不能 await 任何 HTTP：以前就是 await api("/options") 才勾上。
+  const start = client.indexOf("const save = useCallback((patch) => {");
+  const end = client.indexOf("const fail =", start);
+  assert.ok(start > 0 && end > start, "没找到 save()");
+  const click = client.slice(start, end);
+  assert.ok(click.includes("setState({ ...before"), "点下去要立刻回显");
+  assert.ok(!click.includes("await api("), "点击这条路上不能同步等 HTTP");
+
+  // 写成功之后不能再同步等一次 /status（第二趟往返），回读只留给失败分支。
+  const ws = client.indexOf("const writeOptions = useCallback");
+  const we = client.indexOf("const save = useCallback", ws);
+  assert.ok(ws > 0 && we > ws, "没找到 writeOptions()");
+  const write = client.slice(ws, we);
+  assert.ok(write.includes('api("/options"'), "写配置仍要落盘");
+  assert.equal((write.match(/reload\(\)/g) ?? []).length, 1, "只有写失败那条路才回读一次");
+  assert.ok(write.indexOf("catch (e)") < write.indexOf("reload()"), "回读只该发生在失败分支");
+
+  assert.ok(client.includes("selectionPending"), "面板要知道数字还在后台算");
+  for (const token of ["保存中…", "已保存", "正在统计…"]) {
+    assert.ok(client.includes(token), "面板缺反馈文案：" + token);
+  }
 });
 
 step("面板接上了新功能的入口", () => {
