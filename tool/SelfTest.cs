@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace DshBackupAssistant
 {
@@ -50,6 +51,34 @@ namespace DshBackupAssistant
             Check("内嵌插件解出来了", problem == null && File.Exists(Path.Combine(payload, "package.json")), problem);
             Check("内嵌插件含 lib/index.js", File.Exists(Path.Combine(payload, "lib", "index.js")));
             Check("内嵌插件含 cordis.patch.yml", File.Exists(Path.Combine(payload, "cordis.patch.yml")));
+
+            Console.WriteLine("[备份项清单与插件同源]");
+            // 助手和插件各存一份「备份项 id → 数据目录路径」的表，以前靠人肉同步。
+            // 0.3.1 的 0.2.1 兼容提交给插件加了 market，助手没跟上 —— 含 market 的包
+            // 会被 Inspect 判成「缺少：market（不认识的内容）」直接导不进来。
+            // 这里从内嵌插件的 lib/backup.js 里把 ITEMS 抠出来逐项对账。
+            var backupJs = Path.Combine(payload, "lib", "backup.js");
+            if (!File.Exists(backupJs))
+            {
+                Check("内嵌插件里有 lib/backup.js 可以对账", false, backupJs);
+            }
+            else
+            {
+                var pairs = Regex.Matches(File.ReadAllText(backupJs),
+                    "\\{\\s*id:\\s*\"([^\"]+)\"[^}]*?path:\\s*\"([^\"]+)\"");
+                Check("从插件源码里解析出备份项清单", pairs.Count >= 9, pairs.Count.ToString());
+                foreach (Match m in pairs)
+                {
+                    var id = m.Groups[1].Value;
+                    var raw = m.Groups[2].Value;
+                    var rel = raw.StartsWith("./") ? raw.Substring(2) : raw.TrimStart('/');
+                    Check("助手认识插件备份项 " + id + " → " + rel, BackupFile.ItemPath(id) == rel,
+                        "助手表里是 " + (BackupFile.ItemPath(id) ?? "（没有这一项）"));
+                }
+                var pluginIds = pairs.Cast<Match>().Select((m) => m.Groups[1].Value).ToArray();
+                Check("助手没有插件不认识的备份项", BackupFile.ItemIds.All((id) => pluginIds.Contains(id)),
+                    string.Join(",", BackupFile.ItemIds.Where((id) => !pluginIds.Contains(id))));
+            }
 
             Console.WriteLine("[DSH 发现]");
             var loc = PluginInstaller.Detect();
@@ -117,14 +146,22 @@ namespace DshBackupAssistant
             else
             {
                 Console.WriteLine("  info 用 " + file);
-                var manifest = BackupFile.Inspect(file);
-                Check("manifest 是本插件的", manifest.Plugin == App.PluginId, manifest.Plugin);
-                Check("schema 不超过本工具认识的值", manifest.Schema <= BackupFile.Schema, manifest.Schema.ToString());
-                Check("勾选项都能映射到路径", manifest.TargetPaths().Length == manifest.Items.Length,
-                    manifest.TargetPaths().Length + "/" + manifest.Items.Length);
-                var plan = Restore.Analyze(file);
-                Check("导入计划里每个目标都有名有姓", plan.Targets.Length > 0);
-                Console.WriteLine("  info 将覆盖：" + (plan.Existing.Length == 0 ? "（无）" : string.Join("、", plan.Existing)));
+                try
+                {
+                    var manifest = BackupFile.Inspect(file);
+                    Check("manifest 是本插件的", manifest.Plugin == App.PluginId, manifest.Plugin);
+                    Check("schema 不超过本工具认识的值", manifest.Schema <= BackupFile.Schema, manifest.Schema.ToString());
+                    Check("勾选项都能映射到路径", manifest.TargetPaths().Length == manifest.Items.Length,
+                        manifest.TargetPaths().Length + "/" + manifest.Items.Length);
+                    var plan = Restore.Analyze(file);
+                    Check("导入计划里每个目标都有名有姓", plan.Targets.Length > 0);
+                    Console.WriteLine("  info 将覆盖：" + (plan.Existing.Length == 0 ? "（无）" : string.Join("、", plan.Existing)));
+                }
+                catch (Exception error)
+                {
+                    // 自检不该被一份真实备份打死：记 FAIL 继续跑后面的项，退出码照样非 0。
+                    Check("备份目录里最新那份能通过完整性检查", false, Log.Friendly(error));
+                }
             }
 
             Console.WriteLine("[manifest 新字段]");

@@ -100,6 +100,7 @@ namespace DshBackupAssistant
             { "profiles", "profiles" },
             { "guardian", "guardian" },
             { "im", "im" },
+            { "market", "dsh-market" },
             { "credentials", ".credentials.yaml" },
         };
 
@@ -113,8 +114,15 @@ namespace DshBackupAssistant
             { "profiles", "插件与 profile 配置" },
             { "guardian", "启动自愈记录" },
             { "im", "IM 渠道配置" },
+            { "market", "插件市场数据（含登录态）" },
             { "credentials", "凭据 .credentials.yaml（敏感）" },
         };
+
+        /// <summary>本工具认识的备份项 id（自检里拿去和插件源码对账）。</summary>
+        public static string[] ItemIds
+        {
+            get { return ItemPaths.Keys.ToArray(); }
+        }
 
         public static string ItemPath(string id)
         {
