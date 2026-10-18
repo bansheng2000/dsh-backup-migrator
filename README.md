@@ -60,7 +60,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.3"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.4"
 ```
 
 ## 用法
@@ -97,13 +97,13 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 
 窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
 
-下载（v0.3.3，win-x64，49MB）：
+下载（v0.3.4，win-x64，49MB）：
 
 ```
-https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.3/DSH-Backup-Assistant-0.3.3-win-x64.exe
+https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.4/DSH-Backup-Assistant-0.3.4-win-x64.exe
 ```
 
-（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.3-win-x64.exe`，双击一样能跑。）
+（release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.4-win-x64.exe`，双击一样能跑。）
 
 ### 目录结构
 
@@ -163,6 +163,7 @@ export PATH="/c/Windows/system32:$PATH"
 - **写接口走宿主连接层，不挂裸 `webServer` 路由**：裸路由**不在宿主的浏览器鉴权墙后面**，而且经 cloudflared 之类的隧道打进来时 `req.socket.remoteAddress` 恒为回环、连 Host 判据都不好使（实测公网无凭据就能读写别的插件的裸路由）。所以面板的每个动作都打**连接层的精确 fetch 路由** `/api/dsh-backup-migrator/<endpoint>`（`methods: ["POST"]`、`requestBody: "buffered"`）：连接层先验浏览器凭据 + Host/Origin 信任，再要求 `principal.kind === "owner"`；失败对象必须带 `error.details`，否则客户端解析直接报 `invalid server-response failure`。
 - **为什么不用 `ctx.connection.rpc.handle`（0.3.2 那个 405 就是它）**：`rpc.handle` 内部注册前缀路由时要用**读取者 ctx** 去取 `owner.webServer`，而那个 owner 被 createShadow 绑成**连接层插件自己**的 ctx（它的 `inject` 只有 `credentials`），守卫沿那条 fiber 往上找不到 webServer 就抛 `cannot get property "webServer" without inject` —— 本代 DSH 的 `webServer` 由 `dsh-host-webserver` 这个**兄弟**插件 provide，于是任何插件都拿不到 `rpc.handle`。`fetch.register` 不碰 `owner.webServer`，由连接层自己挂的 `/api` 前缀分发，所以**永远可用**。`rpc.handle` 仍保留注册（将来 DSH 修好即恢复），客户端在拿不到精确路由时才回退 `connection.rpc.call`。
 - 上传备份（几百 MB）**不能**进 JSON 请求体，单独注册一条流式路由 `/api/dsh-backup-migrator/import`（`requestBody: "streaming"`）。注意流式路由必须把请求体读干净，否则连接层会 `req.destroy()` 把响应截断。
+- **面板「连点几下勾选丢又冒回来」的修法（0.3.4）**：本地改动写进一个 `latestOptions` ref（点击/输入时**同步**改，不等渲染），勾选切换用函数式 patch `save((cur) => …)` 基于它算差集；`/status` 回来的快照只在**没有写请求在飞**、或首帧、或写失败回读时才覆盖 `options`，其余（900ms 进度轮询、数字后台补算的重试）只回填服务端算出的字段 —— 那些请求可能是**早于点击**发出的，整体替换就会把刚点的勾盖回去（真机表现：点完没了、过一会儿又出来）。
 
 ## 已知限制
 
@@ -177,7 +178,7 @@ export PATH="/c/Windows/system32:$PATH"
 面板能渲染、但每个操作都报 `transport failure for /api/dsh-backup-migrator/…: HTTP 405`，
 说明**宿主侧半插件没注册出路由**（405 是宿主静态前端路由兜住的，不是我们返回的）。
 0.3.2 之前这句里的路径是 `/dsh-backup-migrator/…`（老宿主只挂连接层的 RPC 通道，而本代 DSH 的
-`connection.rpc.handle` 必然注册失败）；0.3.3 起全部端点都走连接层的 `/api` 精确 fetch 路由。
+`connection.rpc.handle` 必然注册失败）；0.3.4 起全部端点都走连接层的 `/api` 精确 fetch 路由。
 
 插件每次启动都会往下面这个文件写启动诊断（写入失败也绝不影响加载）：
 

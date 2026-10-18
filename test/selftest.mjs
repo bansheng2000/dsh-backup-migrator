@@ -498,8 +498,10 @@ step("面板：写配置不再等两趟往返（乐观更新 + 不回扫）", ()
   const end = client.indexOf("const fail =", start);
   assert.ok(start > 0 && end > start, "没找到 save()");
   const click = client.slice(start, end);
-  assert.ok(click.includes("setState({ ...before"), "点下去要立刻回显");
+  assert.ok(click.includes("applyOptions("), "点下去要立刻回显（同步改本地那一份 options）");
   assert.ok(!click.includes("await api("), "点击这条路上不能同步等 HTTP");
+  assert.ok(!click.includes("stateRef"), "乐观更新的基准必须是「最新 options」，不能是渲染期的旧快照");
+  assert.ok(click.includes('typeof patch === "function"'), "patch 要支持函数式：勾选差集基于最新 options 算");
 
   // 写成功之后不能再同步等一次 /status（第二趟往返），回读只留给失败分支。
   const ws = client.indexOf("const writeOptions = useCallback");
@@ -507,13 +509,45 @@ step("面板：写配置不再等两趟往返（乐观更新 + 不回扫）", ()
   assert.ok(ws > 0 && we > ws, "没找到 writeOptions()");
   const write = client.slice(ws, we);
   assert.ok(write.includes('api("/options"'), "写配置仍要落盘");
-  assert.equal((write.match(/reload\(\)/g) ?? []).length, 1, "只有写失败那条路才回读一次");
-  assert.ok(write.indexOf("catch (e)") < write.indexOf("reload()"), "回读只该发生在失败分支");
+  assert.equal((write.match(/reload\(true\)/g) ?? []).length, 1, "只有写失败那条路才回读一次（且要 adopt 磁盘真相）");
+  assert.ok(write.indexOf("catch (e)") < write.indexOf("reload(true)"), "回读只该发生在失败分支");
 
   assert.ok(client.includes("selectionPending"), "面板要知道数字还在后台算");
   for (const token of ["保存中…", "已保存", "正在统计…"]) {
     assert.ok(client.includes(token), "面板缺反馈文案：" + token);
   }
+});
+
+// 真机上「一次连点好几个勾」会丢：点完立刻回显（乐观更新），但那条**早于点击发出**的 /status
+// 会把服务端还没包含新勾的 options 盖回来；随后落盘完成的重试又拉回来 → 「点完没了、过会又出来」。
+// 两侧都堵住：本地用最新 options 算差集（不读渲染期快照），快照只在「飞完/要 adopt」时才覆盖 options。
+step("面板连点勾选不丢：最新 options 算差集 + 在飞的快照不覆盖本地勾", () => {
+  const client = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  const found = /function mergeSnapshot\(old, snap, adopt\) \{[\s\S]*?\n    \}/.exec(client);
+  assert.ok(found !== null, "没找到 mergeSnapshot()（快照回填规则）");
+  const mergeSnapshot = new Function("return (" + found[0] + ")")();
+  const old = { options: { items: ["a", "b"], keepCount: 3 }, selection: { files: 1 }, running: false };
+  const snap = { options: { items: ["a"] }, selection: { files: 9 }, running: true };
+
+  const kept = mergeSnapshot(old, snap, false);
+  assert.deepEqual(kept.options, old.options, "在飞的写请求还没落盘，不能用服务端快照盖掉本地勾选");
+  assert.equal(kept.selection.files, 9, "服务端算出来的数字要回填");
+  assert.equal(kept.running, true, "非 options 字段照旧以服务端为准");
+  assert.deepEqual(mergeSnapshot(old, snap, true).options, snap.options,
+    "adopt=true 要以磁盘为准（首帧/写失败回读用）");
+  assert.equal(mergeSnapshot(null, snap, false), snap, "没有旧状态时直接用快照");
+
+  assert.ok(client.includes("const latestOptions = useRef(null)"), "缺「最新 options」镜像");
+  assert.ok(client.includes("const inflight = useRef(0)"), "缺在飞写请求计数");
+  assert.ok(client.includes("const save = useCallback((patch) => {"));
+  assert.ok(client.includes("const adopt = inflight.current === 0"), "写回音要看在飞计数：飞完才以服务端为准");
+  assert.ok(client.includes("await reload(true)"), "写失败要强制回读磁盘真相");
+  assert.ok(client.includes("save((cur) => {"), "勾选切换必须用函数 patch 读最新勾选");
+  assert.ok(client.includes("if (adopt === true || latestOptions.current === null)"),
+    "首帧/回读要把本地镜像对齐服务端");
+  // 输入框的本地改动也走同一个口子，否则会把在飞的勾覆盖掉。
+  assert.ok(!client.includes("setState({ ...state, options: { ...options,"),
+    "输入框本地改动不能拿渲染闭包里的 state 拼新状态");
 });
 
 step("面板接上了新功能的入口", () => {
