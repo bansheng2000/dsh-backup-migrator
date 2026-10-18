@@ -142,10 +142,17 @@ pwsh -ExecutionPolicy Bypass -File tool/build.ps1 -Output C:\out
 ## 测试
 
 ```powershell
-node test/selftest.mjs
+node test/selftest.mjs              # 纯逻辑：打包/校验/还原/保留策略
+node test/connection-smoke.mjs      # 连接层接线：假 ctx 拉起插件，跑真备份真上传
+                                    # 仓库里没有 node_modules，它会自动改用装机副本
 ```
 
-真 tar、真 zip、真还原，跑在临时目录，不碰真实 `~/.dsh`。覆盖：打包内容对不对（node_modules 不能漏进去）、manifest 校验、非本插件归档被拒、staged/direct 两种还原、`keepCount` 与删除。
+真 tar、真 zip、真还原，跑在临时目录，不碰真实 `~/.dsh`。覆盖：打包内容对不对（node_modules 不能漏进去）、manifest 校验、非本插件归档被拒、staged/direct 两种还原、`keepCount` 与删除、上传落盘防撞名（加 `-2`/`-3`）。
+
+Windows 上跑之前把系统 tar 提到 PATH 前面，否则 GNU tar 不认 `--format zip`：
+```bash
+export PATH="/c/Windows/system32:$PATH"
+```
 
 ## 实现要点
 
