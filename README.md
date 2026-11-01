@@ -60,7 +60,7 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 想完全绕开 git 解析，就直接给 tarball 地址（版本写死最稳）：
 
 ```jsonc
-"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.4"
+"dsh-backup-migrator": "https://codeload.github.com/bansheng2000/dsh-backup-migrator/tar.gz/refs/tags/v0.3.5"
 ```
 
 ## 用法
@@ -97,10 +97,10 @@ node "F:\Programs\DeepSeek Harness\resources\runtime\primary-runtime\dependencie
 
 窗口里四块：**装插件**（检测 DSH → 选 profile → 装，检测来自注册表 `HKLM\...\Uninstall`）、**导入备份**（选文件 → 校验 → 直写或解暂存区）、**备份目录**（可改，会把 EXE 自己复制过去）、**备份列表**。装插件、导入、保存并搬动助手这三个动作都要再确认一次。
 
-下载（v0.3.4，win-x64，49MB）：
+下载（v0.3.5，win-x64，49MB）：
 
 ```
-https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.4/DSH-Backup-Assistant-0.3.4-win-x64.exe
+https://github.com/bansheng2000/dsh-backup-migrator/releases/download/v0.3.5/DSH-Backup-Assistant-0.3.5-win-x64.exe
 ```
 
 （release 的附件名只能用 ASCII，所以下载下来的名字是 `DSH-Backup-Assistant-0.3.4-win-x64.exe`，双击一样能跑。）

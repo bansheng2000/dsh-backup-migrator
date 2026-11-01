@@ -16,10 +16,42 @@
  *   node test/connection-smoke.mjs ~/.dsh/profiles/desktop/node_modules/dsh-backup-migrator/lib/index.js
  */
 import assert from "node:assert/strict";
+import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+/**
+ * 先钉死 tar：Windows 自带 System32\tar.exe 是 bsdtar（认 zip），Git Bash 的 /usr/bin/tar 是
+ * GNU tar（不认 --format zip，直接 exit 2）。谁在 PATH 前面决定本测试是绿还是崩，不能靠 PATH 抽奖。
+ * 显式找一个 libarchive 版；找不到就整轮 skip 并说明原因（exit 0，但打印 SKIPPED，别装作绿了）。
+ */
+function resolveTar() {
+  const candidates = [
+    process.env.DSH_BACKUP_TAR,
+    process.platform === "win32" ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : null,
+    "tar",
+  ].filter((bin) => typeof bin === "string" && bin !== "");
+  for (const bin of candidates) {
+    try {
+      const out = String(childProcess.execFileSync(bin, ["--version"], {
+        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      }));
+      if (/bsdtar|libarchive/i.test(out)) return bin;
+    } catch { /* 换下一个 */ }
+  }
+  let seen = "（PATH 里连 tar 都没有）";
+  try {
+    seen = String(childProcess.execFileSync("tar", ["--version"], { encoding: "utf8" })).split("\n")[0];
+  } catch { /* 保持默认说明 */ }
+  console.log("# 跳过：没找到支持 zip 的 tar（需要 bsdtar / libarchive）。当前 tar --version = " + seen);
+  console.log("# 装一个 bsdtar，或用 DSH_BACKUP_TAR 指到它，再跑本冒烟。");
+  console.log("SKIPPED");
+  process.exit(0);
+}
+process.env.DSH_BACKUP_TAR = resolveTar();
+const TAR = process.env.DSH_BACKUP_TAR;
 
 // 被测入口：默认仓库自己的 lib/index.js，也可传路径（用来验装机副本）。
 // 仓库里没有 node_modules（插件依赖装在 profile 里），所以直接 import 仓库入口会
@@ -87,7 +119,7 @@ mod.apply(ctx, mod.Config({}));
 assert.ok(rpcHandler !== null, "备用通道 rpc.handle 也要注册（将来 DSH 修好即恢复）");
 
 const PANEL = ["status", "backup", "options", "inspect", "restore", "delete", "export", "hello",
-  "notify-targets", "cloud/list", "cloud/upload", "cloud/download", "uninstall"];
+  "notify-targets", "cloud/list", "cloud/upload", "cloud/download", "uninstall", "pre-restores/delete"];
 for (const ep of PANEL) {
   const route = routes.get("/api/dsh-backup-migrator/" + ep);
   assert.ok(route !== undefined, "缺面板精确路由：" + ep + "（现有 " + [...routes.keys()].join(", ") + "）");
@@ -162,6 +194,13 @@ assert.equal(state.options.keepCount, 3, "要真写进 settings");
 assert.equal(opt.value.selectionPending, true, "冷缓存先报 pending（snapshot 的字段名是 selectionPending）");
 console.log("ok   options 写盘 + 回全量快照（乐观更新用）");
 
+// 保留份数 <1 一律拒收：以前 0 会被夹成 1，下一次备份就把历史备份全删了。
+const zero = await call("options", { patch: { keepCount: 0 } });
+assert.equal(zero.ok, false, "keepCount=0 必须拒收");
+assert.ok(zero.error.message.includes("保留份数"), zero.error.message);
+assert.equal(state.options.keepCount, 3, "被拒的值不能落盘");
+console.log("ok   keepCount=0 被拒且不落盘：" + zero.error.message);
+
 const st = await call("status", {});
 assert.equal(st.ok, true);
 const ids = st.value.catalog.map((i) => i.id);
@@ -204,7 +243,17 @@ fs.writeFileSync(path.join(tmpData, "memories", "MEMORY.md"), "# 记忆\n");
 const prevRoot = process.env.DSH_DATA_DIR;
 process.env.DSH_DATA_DIR = tmpData;
 const bmod = await import(pathToFileURL(path.join(path.dirname(entry), "backup.js")).href);
-const made = await bmod.createBackup({ storeDir: tmpStore, items: ["sessions", "memories"] });
+// 造不出一份真备份（tar 不认 zip / 没权限）时，后面全部依赖它 —— 明确 skip，别让
+// 顶层 await 的 rejection 把整个进程打死、看起来像「断言挂了」。
+let made;
+try {
+  made = await bmod.createBackup({ storeDir: tmpStore, items: ["sessions", "memories"] });
+} catch (error) {
+  console.log("# 跳过：造备份失败（" + String(error?.message ?? error).split("\n")[0] + "）");
+  console.log("# 用到的 tar：" + TAR);
+  console.log("SKIPPED");
+  process.exit(0);
+}
 assert.ok(fs.existsSync(made.file), "造出来的备份不存在：" + made.file);
 const bytes = fs.readFileSync(made.file);
 

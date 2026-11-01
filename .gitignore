@@ -6,3 +6,6 @@ tool/obj/
 tool/payload/
 tool/shot-main.png
 tool/shot-main-crop.png
+
+# ops（dsh-ops 插件写入的工作目录）
+.dsh-ops/

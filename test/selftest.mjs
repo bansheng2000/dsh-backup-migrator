@@ -15,13 +15,46 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import { join, resolve } from "node:path";
 
 const tmp = mkdtempSync(join(tmpdir(), "bm-selftest-"));
+
+/**
+ * 先钉死用哪个 tar：Windows 自带的 System32\tar.exe 是 bsdtar（认 zip），
+ * Git Bash 的 /usr/bin/tar 是 GNU tar（不认 zip，只会 exit 2）。谁在 PATH 前面决定测试是绿还是红，
+ * 不能靠调用者的 PATH 抽奖：这里显式找一个 libarchive 版；找不到就整轮 skip 并说明原因。
+ */
+function resolveTar() {
+  const candidates = [
+    process.env.DSH_BACKUP_TAR,
+    process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : null,
+    "tar",
+  ].filter((bin) => typeof bin === "string" && bin !== "");
+  for (const bin of candidates) {
+    try {
+      const out = String(execFileSync(bin, ["--version"], {
+        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      }));
+      if (/bsdtar|libarchive/i.test(out)) return bin;
+      if (bin === process.env.DSH_BACKUP_TAR) console.log("# 注意：DSH_BACKUP_TAR 指向的 tar 不支持 zip，忽略它");
+    } catch { /* 换下一个 */ }
+  }
+  let seen = "（PATH 里连 tar 都没有）";
+  try { seen = String(execFileSync("tar", ["--version"], { encoding: "utf8" })).split("\n")[0]; } catch { /* 保持默认说明 */ }
+  console.log("# 跳过：没找到支持 zip 的 tar（需要 bsdtar / libarchive）。当前 tar --version = " + seen);
+  console.log("# 装一个 bsdtar，或用 DSH_BACKUP_TAR 指到它，再跑本自检。");
+  console.log("SKIPPED");
+  process.exit(0);
+}
+
+const TAR = resolveTar();
+// 必须在 import ../lib/backup.js 之前设好：模块内的 tarBin() 解析会先看这个变量。
+process.env.DSH_BACKUP_TAR = TAR;
+
 const source = join(tmp, "source");          // 「旧电脑」的数据目录
 const store = join(tmp, "store");            // 备份存放目录
 const target = join(tmp, "target");          // 「新电脑」的数据目录
@@ -45,8 +78,9 @@ put(join(source, ".credentials.yaml"), "token: secret");
 process.env.DSH_DATA_DIR = source;
 
 const { createBackup, deleteBackup, exportBackup, inspectBackup, invalidateScan, itemsOf, listBackupFiles,
-  listBackups, prune, readManifest, restoreBackup, dataRootOf, storeDirOf, defaultOptions, scan, scanLazy,
-  checkSpace, dshVersionOf, freeBytesOf, needBytesOf, rememberDshVersion } =
+  listBackups, prune, readManifest, restoreBackup, rollbackMoved, readIndex, writeIndex, listPreRestores,
+  deletePreRestore, setTarBin, dataRootOf, storeDirOf, defaultOptions, scan, scanLazy, checkSpace, dshVersionOf,
+  freeBytesOf, needBytesOf, rememberDshVersion } =
   await import("../lib/backup.js");
 const { cloudDownload, cloudList, cloudUpload, cloudOf, parsePropfind, remoteUrl, authHeaders, CLOUD_BACKUP_NAME } =
   await import("../lib/cloud.js");
@@ -107,7 +141,7 @@ const keptFile = join(tmp, "kept", first.name);
 mkdirSync(join(tmp, "kept"), { recursive: true });
 writeFileSync(keptFile, readFileSync(first.file));
 
-const entries = String(execFileSync("tar", ["-tf", first.file], { encoding: "utf8" }));
+const entries = String(execFileSync(TAR, ["-tf", first.file], { encoding: "utf8" }));
 step("归档含 manifest + 勾选内容", () => {
   assert.ok(entries.includes("./dsh-backup-manifest.json"), "缺 manifest");
   assert.ok(entries.includes("./sessions/ws/session-a/session.v4.json"), "缺 sessions");
@@ -146,8 +180,38 @@ step("非本插件的归档被拒", () => {
   mkdirSync(join(foreign, "sub"), { recursive: true });
   writeFileSync(join(foreign, "sub", "a.txt"), "hello", "utf8");
   const zipped = join(tmp, "foreign.zip");
-  execFileSync("tar", ["--format", "zip", "-cf", zipped, "-C", foreign, "./sub"], { stdio: "ignore" });
+  execFileSync(TAR, ["--format", "zip", "-cf", zipped, "-C", foreign, "./sub"], { stdio: "ignore" });
   assert.throws(() => inspectBackup(zipped), /不是 dsh-backup-migrator|没有可读的 manifest/);
+});
+
+step("归档条目数少于 manifest 声明时被标为问题（截断包不能一路过校验）", () => {
+  const dir = join(tmp, "short-arch");
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(join(dir, "sessions"), { recursive: true });
+  writeFileSync(join(dir, "sessions", "a.jsonl"), "x", "utf8");
+  writeFileSync(join(dir, "dsh-backup-manifest.json"), JSON.stringify({
+    plugin: "dsh-backup-migrator", pluginVersion: "t", schema: 1, format: "zip",
+    createdAt: new Date().toISOString(), items: ["sessions"], expectedFiles: 99,
+  }), "utf8");
+  const zipped = join(tmp, "short.zip");
+  execFileSync(TAR, ["--format", "zip", "-cf", zipped, "-C", dir, "./sessions", "./dsh-backup-manifest.json"],
+    { stdio: "ignore" });
+  const r = inspectBackup(zipped);
+  assert.ok(r.problems.some((p) => p.includes("条目数不足")),
+    "没报条目数不足，这种包会被 direct 直接覆盖：" + r.problems.join("；"));
+});
+
+step("遗留回滚点：能列出、能删；越界名与不存在都拒", () => {
+  const root = join(tmp, "pre-restore-root");
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(join(root, ".pre-restore-20260101-000000"), { recursive: true });
+  mkdirSync(join(root, "sessions"), { recursive: true });
+  assert.deepEqual(listPreRestores(root).map((row) => row.name), [".pre-restore-20260101-000000"]);
+  assert.throws(() => deletePreRestore("../sessions", root), /不合法/);
+  assert.throws(() => deletePreRestore(".pre-restore-19700101-000000", root), /已经不在了/);
+  assert.ok(existsSync(join(root, "sessions")), "越界名被拒时不能删到别的东西");
+  deletePreRestore(".pre-restore-20260101-000000", root);
+  assert.deepEqual(listPreRestores(root), [], "删掉之后列表里不该还有");
 });
 
 // ---- 4. 换机还原 -------------------------------------------------------------
@@ -184,6 +248,14 @@ step("direct 把内容落到目标数据目录", () => {
   assert.ok(!existsSync(join(target, "dsh-backup-manifest.json")), "manifest 不该写进数据目录");
 });
 
+step("direct 还原交出要重装的 profile（node_modules 不进包，不装插件全没）", () => {
+  assert.ok(Array.isArray(direct.needsInstall), "direct 必须返回 needsInstall，否则用户重启后插件全丢还不知道为什么");
+  assert.ok(direct.needsInstall.includes("desktop"), "应列出 profiles/desktop：" + JSON.stringify(direct.needsInstall));
+  const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(src.includes("dsh plugin --profile "), "面板没把重装命令写出来");
+  assert.ok(src.includes("needsInstall"), "面板没读 needsInstall");
+});
+
 step("direct 再还原一次：先挪开旧内容再覆盖，不留 .pre-restore 残渣", () => {
   // 覆盖前把要替换的顶层项挪到一边，是「导入失败能回滚」和「DSH 开着就拒绝还原」的同一套机制：
   // 宿主还攥着会话文件句柄时目录搬不动，rename 直接抛错。
@@ -193,6 +265,96 @@ step("direct 再还原一次：先挪开旧内容再覆盖，不留 .pre-restore
     [], "回滚点用完必须删掉，别留在数据目录里");
   assert.ok(existsSync(join(target, "sessions", "ws", "session-a", "session.v4.json")));
 });
+
+step("还原半途失败能真正回滚：旧数据回到原位，半成品删掉，不留回滚点", () => {
+  // 复现的是真实故障形态：tar 已经把半份文件解进 target/sessions，旧目录要 rename 回去。
+  // 老写法直接 rename 到已存在的非空目录 → Windows 上是 EPERM → 被 catch{/* 尽力而为 */} 吞掉，
+  // 结果数据根里只剩半份新数据，旧数据卡在 .pre-restore-* 里没人知道。
+  const root = join(tmp, "rollback");
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(join(root, "sessions"), { recursive: true });
+  writeFileSync(join(root, "sessions", "old.jsonl"), "old", "utf8");
+  mkdirSync(join(root, "memories"), { recursive: true });
+  writeFileSync(join(root, "memories", "MEMORY.md"), "old-memory", "utf8");
+  const aside = join(root, ".pre-restore-test");
+  mkdirSync(aside, { recursive: true });
+  const moved = ["sessions", "memories"];
+  for (const name of moved) renameSync(join(root, name), join(aside, name));
+  mkdirSync(join(root, "sessions"), { recursive: true });
+  writeFileSync(join(root, "sessions", "partial.jsonl"), "new", "utf8");
+
+  const stuck = rollbackMoved(root, aside, moved);
+  assert.deepEqual(stuck, [], "不该有搬不回去的项：" + stuck.join("、"));
+  assert.equal(readFileSync(join(root, "sessions", "old.jsonl"), "utf8"), "old", "旧 sessions 必须回到原位");
+  assert.ok(!existsSync(join(root, "sessions", "partial.jsonl")), "半成品必须删掉，不能和旧数据混在一起");
+  assert.equal(readFileSync(join(root, "memories", "MEMORY.md"), "utf8"), "old-memory", "memories 也得回来");
+  assert.ok(!existsSync(aside), "回滚成功后回滚点要删掉，别留空目录");
+
+  // 解包前本机没有、解包后才冒出来的项（新机器上的 attachments）：只有半份新数据，必须一并删掉。
+  // 注意不能误删「本来就有」的项——created 是解包前采集的，和 moved 用的是同一份清单。
+  const createdDir = join(root, "attachments");
+  mkdirSync(createdDir, { recursive: true });
+  writeFileSync(join(createdDir, "half.png"), "new");
+  const stuck2 = rollbackMoved(root, join(root, ".pre-restore-none"), [], ["attachments"]);
+  assert.deepEqual(stuck2, []);
+  assert.ok(!existsSync(createdDir), "本次新建的项留着就是半个附件目录，必须删掉");
+  assert.equal(readFileSync(join(root, "sessions", "old.jsonl"), "utf8"), "old", "created 的清理不能碰 moved 的项");
+});
+
+step("保留份数 <1 一律拒收，不静默夹成 1 份", () => {
+  // 面板把清空的输入框当 Number("")=0 传过来；老实现 Math.max(1,…) 夹成 1，
+  // 下一次备份就把除最新一份外的历史全删了，而界面上只显示「已保存」。
+  const store2 = join(tmp, "prune-guard");
+  rmSync(store2, { recursive: true, force: true });
+  mkdirSync(store2, { recursive: true });
+  for (let i = 1; i <= 3; i += 1) writeFileSync(join(store2, "dsh-backup-2026010" + i + "-000000.zip"), "x");
+  assert.throws(() => prune(store2, { keep: 0 }), /保留份数必须是/, "keep=0 必须拒收");
+  assert.throws(() => prune(store2, { keep: Number("") }), /保留份数必须是/, "keep=Number('') 必须拒收");
+  assert.equal(readdirSync(store2).filter((n) => n.endsWith(".zip")).length, 3, "被拒时一份都不能删");
+});
+
+step("备份目录落在备份项里 / 是它的上级时被拒，默认位置照常放行", () => {
+  // 套娃打包含义：包越打越大；direct 还原还会把备份目录连同正在读的文件一起 rename 走。
+  const root = join(tmp, "guard-root");
+  mkdirSync(join(root, "sessions"), { recursive: true });
+  const env = { DSH_DATA_DIR: root };
+  assert.throws(() => storeDirOf({ storeDir: join(root, "sessions", "bk") }, env), /不能放在/);
+  assert.throws(() => storeDirOf({ storeDir: join(root, "sessions") }, env), /不能放在/);
+  assert.throws(() => storeDirOf({ storeDir: root }, env), /不能放在/);
+  assert.equal(storeDirOf({}, env), join(root, "backups"), "默认的 <数据根>/backups 必须放行");
+  assert.equal(storeDirOf({ storeDir: join(root, "backups") }, env), join(root, "backups"));
+});
+
+step("index.json 原子写：不留 .tmp 残渣，读回一致", () => {
+  const dir = join(tmp, "index-atomic");
+  rmSync(dir, { recursive: true, force: true });
+  writeIndex(dir, []);
+  const names = readdirSync(dir);
+  assert.deepEqual(names.filter((n) => n.includes(".tmp-")), [], "临时文件必须已经 rename 掉");
+  assert.ok(names.includes("index.json"));
+  assert.deepEqual(readIndex(dir), []);
+});
+
+step("tar 挂了只抛可读错误（inspectBackup 不会把进程带走）", () => {
+  // 换一台只有 GNU tar 的机器时，用户传进来的 zip 就是这个形状：tar 立刻 exit 2。
+  // 校验必须变成一条普通错误（面板显示成 problem / 400），不能是未捕获的 rejection。
+  const prev = setTarBin(join(tmp, "no-such-tar"));
+  try {
+    assert.throws(() => inspectBackup(first.file), /没有可读的 manifest/,
+      "tar 挂了必须变成人话错误，不能把 Command failed 原始串抛给面板");
+  } finally {
+    setTarBin(prev);
+  }
+});
+
+// 异步那条路（runTar）：promise 必须 reject 到调用方，不能悬空把进程打死。
+setTarBin(join(tmp, "no-such-tar"));
+await assert.rejects(
+  () => createBackup({ ...options, storeDir: join(tmp, "no-tar-store") }, { version: "t" }),
+  /ENOENT|tar/i,
+);
+setTarBin(TAR);
+console.log("  ok   tar 不可用时 createBackup 只 reject（runTar 的 promise 没有悬空）");
 
 step("导出撞名不覆盖，自动加序号", () => {
   // 覆盖式导出会让「上一次拷到 U 盘那份」静默消失——备份工具不该有这种默认语义。
@@ -265,6 +427,50 @@ step("CSS 每条规则都以自建 DOM 祖先类 .bm-wrap 为前缀", () => {
   assert.ok(source.includes('className: "bm-wrap"'), "渲染树根节点必须带 .bm-wrap，否则前缀选择器匹配不到");
 });
 
+step("键盘焦点可见：有 :focus-visible 描边，且没有裸 outline:none", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  // .bm-btn 用 all: unset 抹掉了浏览器默认焦点环，输入框原来又显式 outline: none，
+  // 只按 Tab 走一遍完全看不出焦点在哪。
+  assert.ok(source.includes(":focus-visible"), "缺 :focus-visible，键盘导航看不到焦点");
+  assert.ok(!/outline:\s*none/.test(source), "还有裸 outline:none 在抹焦点环");
+});
+
+step("还原 / 删除都要二次确认（误点不可逆）", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  const helper = source.slice(source.indexOf("const ask = useCallback"), source.indexOf("// 老配置里可能存着 keepCount"));
+  assert.ok(helper.includes("globalThis.confirm"), "确认框助手要先试原生 confirm");
+  assert.ok(helper.includes("pendingRef"), "拿不到 confirm 时要退化成「再点一次」，不能变成死路");
+  const restore = source.slice(source.indexOf("const doRestore"), source.indexOf("const doDelete"));
+  assert.ok(restore.includes('ask("restore:'), "还原没有二次确认：direct 一次误点就覆盖数据根");
+  assert.ok(restore.includes("回滚点"), "还原确认文案要说明回滚点会被删掉");
+  assert.ok(restore.includes("整目录替换") && restore.includes("覆盖合并"),
+    "两种还原语义（direct 替换 / staged 合并）都要写进确认文案");
+  const del = source.slice(source.indexOf("const doDelete"), source.indexOf("const doExport"));
+  assert.ok(del.includes('ask("delete:'), "删除没有确认：最后一份删了就不可恢复");
+  assert.ok(del.includes("最后一份"), "删最后一份时要单独提示不可恢复");
+  const un = source.slice(source.indexOf("const doUninstall"), source.indexOf("if (state === null)"));
+  assert.ok(un.includes('ask("uninstall"'), "卸载还在用另一套确认风格");
+  assert.ok(!un.includes("globalThis.confirm"), "卸载不该自己碰 globalThis.confirm（拿不到时会变成死路）");
+});
+
+step("老配置里存成 0 的保留份数：面板显示 10 并标出原值，且自动落盘修正", () => {
+  // 旧面板把清空的输入框存成 Number("")=0；升级后 createBackup 会硬失败，
+  // 所以面板必须既显示合法值、又告诉用户「你的值被修正过」，不能悄悄改。
+  const src = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(src.includes("已修正为 10"), "面板没标出「已修正为 10」");
+  assert.ok(src.includes("原值 "), "面板没写出原值");
+  assert.ok(src.includes("save({ keepCount: 10 })"), "修正没有落盘，下次打开还是 0");
+  assert.ok(/keepShown/.test(src), "输入框没换成修正后的值");
+});
+
+step("导入入口键盘可达：label 可聚焦、Enter/Space 转成 input.click()", () => {
+  const source = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
+  assert.ok(source.includes("tabIndex: 0"), "文件选择入口的 label 不可聚焦，纯键盘到不了");
+  assert.ok(/onKeyDown:\s*\(e\) =>/.test(source), "缺 onKeyDown，键盘按不出文件对话框");
+  assert.ok(source.includes("input.click()"), "Enter/Space 没转成 input.click()");
+  assert.ok(source.includes('"aria-label"'), "缺可访问名");
+});
+
 // ---- 8. 选文件夹接的是宿主现成能力，不是自己画的输入框 -----------------------
 // 用户明确要求「像选备份文件那样点选文件夹，不要填地址」。桌面端 preload 暴露
 // __DSH_DIRECTORY_PICKER__.pick()；Web GUI 没有 preload，退回 ctx.uiWorkspace.pickDirectory()
@@ -326,7 +532,7 @@ step("空间不够时，还原阶段一个文件都不写", () => {
     missing: [], unpackedBytes: 1024 ** 5, note: "test",
   }));
   const file = join(tmp, "huge.zip");
-  execFileSync("tar", ["--format", "zip", "-cf", file, "-C", dir, "./sessions", "./dsh-backup-manifest.json"], { stdio: "ignore" });
+  execFileSync(TAR, ["--format", "zip", "-cf", file, "-C", dir, "./sessions", "./dsh-backup-manifest.json"], { stdio: "ignore" });
   const victim = join(tmp, "space-target");
   process.env.DSH_DATA_DIR = victim;
   try {
